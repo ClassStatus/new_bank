@@ -48,7 +48,7 @@ form.addEventListener('submit', async function(e) {
     formData.append('file', file);
     statusDiv.textContent = 'Uploading and extracting tables...';
     try {
-        const resp = await fetch('/upload', {
+        const resp = await fetch('https://bank-statement-convertor.onrender.com/upload', {
             method: 'POST',
             body: formData
         });
