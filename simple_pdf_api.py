@@ -125,7 +125,8 @@ async def upload_pdf(file: UploadFile = File(...), password: str = Form(None)):
                 return {"success": False, "message": "PDF is password protected. Please provide password."}
         else:
             shutil.rmtree(out_dir)
-            return {"success": False, "message": f"PDF processing error: {str(e)}"}
+            msg = str(e) or "Unknown error. File may be corrupted or unsupported, or password is incorrect."
+            return {"success": False, "message": f"PDF processing error: {msg}"}
     if tables_found == 0:
         shutil.rmtree(out_dir)
         return {"success": False, "message": "No tables found in PDF."}
