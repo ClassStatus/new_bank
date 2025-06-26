@@ -3,7 +3,7 @@ import shutil
 import uuid
 import time
 from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -54,15 +54,19 @@ scheduler.start()
 
 # Helper: extract tables and save all formats
 SUPPORTED_FORMATS = ["html", "excel", "csv", "json"]
-def extract_and_save(pdf_bytes, out_dir):
+def extract_and_save(pdf_bytes, out_dir, password=None):
     tables = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages, 1):
-            for table in page.find_tables():
-                data = table.extract()
-                if data and len(data) > 1:
-                    df = pd.DataFrame(data[1:], columns=data[0])
-                    tables.append({"page": page_num, "data": df})
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                for table in page.find_tables():
+                    data = table.extract()
+                    if data and len(data) > 1:
+                        df = pd.DataFrame(data[1:], columns=data[0])
+                        tables.append({"page": page_num, "data": df})
+    except Exception as e:
+        # If password is required or wrong, propagate error
+        raise e
     if not tables:
         return 0
     # Save HTML
@@ -97,7 +101,7 @@ def extract_and_save(pdf_bytes, out_dir):
     return len(tables)
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), password: str = Form(None)):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
     pdf_bytes = await file.read()
@@ -107,7 +111,21 @@ async def upload_pdf(file: UploadFile = File(...)):
     # Save original PDF
     with open(os.path.join(out_dir, "original.pdf"), "wb") as f:
         f.write(pdf_bytes)
-    tables_found = extract_and_save(pdf_bytes, out_dir)
+    # Try to extract tables, handle password-protected PDFs
+    try:
+        tables_found = extract_and_save(pdf_bytes, out_dir, password=password)
+    except Exception as e:
+        # Check for password protection error
+        err_msg = str(e).lower()
+        if "password" in err_msg or "encrypted" in err_msg or "incorrect password" in err_msg:
+            shutil.rmtree(out_dir)
+            if password:
+                return {"success": False, "message": "Incorrect PDF password."}
+            else:
+                return {"success": False, "message": "PDF is password protected. Please provide password."}
+        else:
+            shutil.rmtree(out_dir)
+            return {"success": False, "message": f"PDF processing error: {str(e)}"}
     if tables_found == 0:
         shutil.rmtree(out_dir)
         return {"success": False, "message": "No tables found in PDF."}
