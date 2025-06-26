@@ -1,68 +1,150 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Simple PDF Table Extractor</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 0; }
-        .container { max-width: 500px; margin: 40px auto; background: #fff; padding: 30px 30px 20px 30px; border-radius: 8px; box-shadow: 0 2px 8px #0001; }
-        h2 { text-align: center; }
-        .status { margin: 15px 0; color: #333; }
-        .downloads { margin-top: 20px; display: flex; flex-direction: column; gap: 10px; }
-        .downloads a, .downloads button { padding: 10px; border: none; border-radius: 4px; background: #1976d2; color: #fff; text-decoration: none; text-align: center; font-size: 16px; cursor: pointer; transition: background 0.2s; }
-        .downloads a:hover, .downloads button:hover { background: #125ea8; }
-        .hidden { display: none; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h2>Simple PDF Table Extractor</h2>
-    <form id="uploadForm">
-        <input type="file" id="pdfFile" accept="application/pdf" required />
-        <button type="submit">Upload & Extract</button>
-    </form>
-    <div class="status" id="status"></div>
-    <div class="downloads hidden" id="downloads">
-        <a href="https://bank-statement-convertor.onrender.com/download/html" target="_blank" id="htmlLink">Download HTML</a>
-        <a href="https://bank-statement-convertor.onrender.com/download/excel" id="excelLink">Download Excel</a>
-        <a href="https://bank-statement-convertor.onrender.com/download/csv" id="csvLink">Download CSV (ZIP)</a>
-        <a href="https://bank-statement-convertor.onrender.com/download/json" id="jsonLink">Download JSON</a>
-    </div>
-</div>
-<script>
-const form = document.getElementById('uploadForm');
-const pdfFile = document.getElementById('pdfFile');
-const statusDiv = document.getElementById('status');
-const downloadsDiv = document.getElementById('downloads');
+from fastapi import FastAPI, UploadFile, File, HTTPException, Response
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import pdfplumber
+import pandas as pd
+import io
+import tempfile
+import zipfile
 
-form.addEventListener('submit', async function(e) {
-    e.preventDefault();
-    statusDiv.textContent = '';
-    downloadsDiv.classList.add('hidden');
-    if (!pdfFile.files.length) {
-        statusDiv.textContent = 'Please select a PDF file.';
-        return;
+app = FastAPI(
+    title="Simple PDF Table Extractor API",
+    description="Upload a PDF, get tables as HTML, Excel, CSV, or JSON. No auth, no DB, no limits.",
+    version="1.0.0-simple"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def extract_tables(pdf_bytes: bytes):
+    tables = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            for table in page.find_tables():
+                data = table.extract()
+                if data and len(data) > 1:
+                    df = pd.DataFrame(data[1:], columns=data[0])
+                    tables.append({
+                        "page": page_num,
+                        "data": df
+                    })
+    return tables
+
+def tables_to_html(tables):
+    html = "<html><body>"
+    for i, t in enumerate(tables):
+        html += f"<h3>Table {i+1} (Page {t['page']})</h3>"
+        html += t['data'].to_html(index=False, border=1)
+    html += "</body></html>"
+    return html
+
+def tables_to_excel(tables):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        for i, t in enumerate(tables):
+            t['data'].to_excel(writer, sheet_name=f"Table_{i+1}_Page_{t['page']}", index=False)
+    output.seek(0)
+    return output
+
+def tables_to_csv_zip(tables):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as zf:
+        for i, t in enumerate(tables):
+            csv_bytes = t['data'].to_csv(index=False).encode('utf-8')
+            zf.writestr(f"table_{i+1}_page_{t['page']}.csv", csv_bytes)
+    output.seek(0)
+    return output
+
+def tables_to_json(tables):
+    result = []
+    for i, t in enumerate(tables):
+        result.append({
+            "table": i+1,
+            "page": t['page'],
+            "columns": list(t['data'].columns),
+            "rows": t['data'].to_dict(orient='records')
+        })
+    return result
+
+@app.post("/extract", summary="Upload PDF and extract tables")
+async def extract_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    pdf_bytes = await file.read()
+    tables = extract_tables(pdf_bytes)
+    if not tables:
+        return {"success": False, "message": "No tables found in PDF."}
+    # Prepare download links (simulate, as FastAPI can't serve files from memory by link directly)
+    return {
+        "success": True,
+        "tables_found": len(tables),
+        "message": "Tables extracted. Use /download endpoints to get files.",
+        "download_endpoints": [
+            {"format": "html", "url": "/download/html"},
+            {"format": "excel", "url": "/download/excel"},
+            {"format": "csv_zip", "url": "/download/csv"},
+            {"format": "json", "url": "/download/json"}
+        ]
     }
-    const file = pdfFile.files[0];
-    const formData = new FormData();
-    formData.append('file', file);
-    statusDiv.textContent = 'Uploading and extracting tables...';
-    try {
-        const resp = await fetch('https://bank-statement-convertor.onrender.com/upload', {
-            method: 'POST',
-            body: formData
-        });
-        const data = await resp.json();
-        if (data.success) {
-            statusDiv.textContent = `Success! ${data.tables_found} tables extracted. Download below:`;
-            downloadsDiv.classList.remove('hidden');
-        } else {
-            statusDiv.textContent = data.message || 'No tables found.';
-        }
-    } catch (err) {
-        statusDiv.textContent = 'Error: ' + err;
-    }
-});
-</script>
-</body>
-</html> 
+
+# In-memory storage for last uploaded tables (for demo, not for production)
+from threading import Lock
+last_tables = {"tables": None}
+tables_lock = Lock()
+
+@app.post("/upload", summary="Upload PDF and store tables for download")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    pdf_bytes = await file.read()
+    tables = extract_tables(pdf_bytes)
+    if not tables:
+        return {"success": False, "message": "No tables found in PDF."}
+    with tables_lock:
+        last_tables["tables"] = tables
+    return {"success": True, "tables_found": len(tables), "message": "Tables stored. Now use /download endpoints."}
+
+@app.get("/download/html", response_class=HTMLResponse)
+def download_html():
+    with tables_lock:
+        tables = last_tables["tables"]
+    if not tables:
+        return HTMLResponse("<h2>No tables available. Please upload a PDF first.</h2>", status_code=400)
+    html = tables_to_html(tables)
+    return HTMLResponse(content=html, status_code=200)
+
+@app.get("/download/excel")
+def download_excel():
+    with tables_lock:
+        tables = last_tables["tables"]
+    if not tables:
+        return Response("No tables available. Please upload a PDF first.", status_code=400)
+    excel_bytes = tables_to_excel(tables)
+    return StreamingResponse(excel_bytes, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=extracted_tables.xlsx"})
+
+@app.get("/download/csv")
+def download_csv():
+    with tables_lock:
+        tables = last_tables["tables"]
+    if not tables:
+        return Response("No tables available. Please upload a PDF first.", status_code=400)
+    csv_zip = tables_to_csv_zip(tables)
+    return StreamingResponse(csv_zip, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=extracted_tables_csv.zip"})
+
+@app.get("/download/json")
+def download_json():
+    with tables_lock:
+        tables = last_tables["tables"]
+    if not tables:
+        return JSONResponse({"error": "No tables available. Please upload a PDF first."}, status_code=400)
+    json_data = tables_to_json(tables)
+    return JSONResponse(content=json_data)
+
+@app.get("/")
+def root():
+    return {"message": "Welcome to Simple PDF Table Extractor API. POST /upload with a PDF, then GET /download/{format}"} 
