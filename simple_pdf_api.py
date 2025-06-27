@@ -172,7 +172,7 @@ def to_tally_xml(tables):
     ]
     return '\n'.join(xml)
 
-def extract_and_save(pdf_bytes, out_dir, password=None):
+def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
     tables = []
     unique_tables = {}  # key: tuple(headers), value: list of DataFrames
     non_blank_pages = set()
@@ -197,18 +197,27 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
         raise e
     if not tables:
         return 0, 0, None, None
+    # Use file_map for output names if provided
+    if file_map is None:
+        file_map = {
+            "html": "tables.html",
+            "excel": "tables.xlsx",
+            "csv": "tables.csv",
+            "json": "tables.json",
+            "tallyxml": "tables_tally.xml"
+        }
     # Save HTML (only tables, no extra text)
     html = ""
     for i, t in enumerate(tables):
         html += t['data'].to_html(index=False, border=1)
-    with open(os.path.join(out_dir, "tables.html"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, file_map["html"]), "w", encoding="utf-8") as f:
         f.write(html)
     # Save Excel
-    with pd.ExcelWriter(os.path.join(out_dir, "tables.xlsx"), engine='xlsxwriter') as writer:
+    with pd.ExcelWriter(os.path.join(out_dir, file_map["excel"]), engine='xlsxwriter') as writer:
         for i, t in enumerate(tables):
             t['data'].to_excel(writer, sheet_name=f"Table_{i+1}_Page_{t['page']}", index=False)
     # Save CSV (merge tables with same headers)
-    with open(os.path.join(out_dir, "tables.csv"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, file_map["csv"]), "w", encoding="utf-8") as f:
         for headers, dfs in unique_tables.items():
             merged_df = pd.concat(dfs, ignore_index=True)
             merged_df.to_csv(f, index=False)
@@ -223,11 +232,11 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
             "rows": t['data'].to_dict(orient='records')
         })
     import json
-    with open(os.path.join(out_dir, "tables.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, file_map["json"]), "w", encoding="utf-8") as f:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
     # Save Tally XML
     tally_xml = to_tally_xml(tables)
-    with open(os.path.join(out_dir, "tables_tally.xml"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, file_map["tallyxml"]), "w", encoding="utf-8") as f:
         f.write(tally_xml)
     # Extract balances (use merged tables for closing balance)
     opening, closing = extract_balances(tables, unique_tables)
@@ -246,12 +255,44 @@ async def upload_pdf(
     file_id = str(uuid.uuid4())
     out_dir = os.path.join(TEMP_DIR, file_id)
     os.makedirs(out_dir, exist_ok=True)
+    # Determine output file base name
+    base_name = os.path.splitext(file.filename)[0]
+    use_custom_name = base_name.lower() == 'zyx'
+    file_map = {
+        "html": f"{base_name}.html" if use_custom_name else "tables.html",
+        "excel": f"{base_name}.xlsx" if use_custom_name else "tables.xlsx",
+        "csv": f"{base_name}.csv" if use_custom_name else "tables.csv",
+        "json": f"{base_name}.json" if use_custom_name else "tables.json",
+        "tallyxml": f"{base_name}_tally.xml" if use_custom_name else "tables_tally.xml"
+    }
     # Save original PDF
     with open(os.path.join(out_dir, "original.pdf"), "wb") as f:
         f.write(pdf_bytes)
     # Try to extract tables, handle password-protected PDFs
     try:
-        tables_found, pages_count, opening_balance, closing_balance = extract_and_save(pdf_bytes, out_dir, password=password)
+        tables_found, pages_count, opening_balance, closing_balance = extract_and_save(
+            pdf_bytes, out_dir, password=password, file_map=file_map)
+        # Re-extract unique_tables for merged tables JSON
+        tables = []
+        unique_tables = {}
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                for table in page.find_tables():
+                    data = table.extract()
+                    if data and len(data) > 1:
+                        df = pd.DataFrame(data[1:], columns=data[0])
+                        tables.append({"page": page_num, "data": df})
+                        headers_key = tuple(df.columns)
+                        if headers_key not in unique_tables:
+                            unique_tables[headers_key] = []
+                        unique_tables[headers_key].append(df)
+        merged_tables_json = []
+        for headers, dfs in unique_tables.items():
+            merged_df = pd.concat(dfs, ignore_index=True)
+            merged_tables_json.append({
+                "columns": list(merged_df.columns),
+                "rows": merged_df.to_dict(orient="records")
+            })
     except Exception as e:
         err_msg = str(e).lower()
         if "password" in err_msg or "encrypted" in err_msg or "incorrect password" in err_msg:
@@ -275,8 +316,10 @@ async def upload_pdf(
         "pages_count": pages_count,
         "file_id": file_id,
         "download_links": links,
+        "output_file_names": file_map,
         "opening_balance": opening_balance,
-        "closing_balance": closing_balance
+        "closing_balance": closing_balance,
+        "merged_tables_json": merged_tables_json
     }
 
 @app.get("/download/{file_id}/{fmt}")
@@ -284,14 +327,39 @@ def download_file(file_id: str, fmt: str):
     if fmt not in SUPPORTED_FORMATS:
         raise HTTPException(status_code=400, detail="Invalid format.")
     safe_id = file_id.replace("..", "")  # Prevent path traversal
-    file_map = {
-        "html": "tables.html",
-        "excel": "tables.xlsx",
-        "csv": "tables.csv",
-        "json": "tables.json",
-        "tallyxml": "tables_tally.xml"
+    # Try to find the file name from the output directory
+    out_dir = os.path.join(TEMP_DIR, safe_id)
+    # Look for a file with the right extension and base name
+    ext_map = {
+        "html": ".html",
+        "excel": ".xlsx",
+        "csv": ".csv",
+        "json": ".json",
+        "tallyxml": "_tally.xml"
     }
-    file_path = os.path.join(TEMP_DIR, safe_id, file_map[fmt])
+    # Prefer zyx.* if present, else fallback
+    files = os.listdir(out_dir) if os.path.exists(out_dir) else []
+    file_name = None
+    for f in files:
+        if fmt == "tallyxml":
+            if f.endswith(ext_map[fmt]):
+                file_name = f
+                break
+        else:
+            if f.endswith(ext_map[fmt]) and (f.startswith("zyx") or f == f"tables{ext_map[fmt]}"):
+                file_name = f
+                break
+    if not file_name:
+        # fallback to default
+        file_map = {
+            "html": "tables.html",
+            "excel": "tables.xlsx",
+            "csv": "tables.csv",
+            "json": "tables.json",
+            "tallyxml": "tables_tally.xml"
+        }
+        file_name = file_map[fmt]
+    file_path = os.path.join(out_dir, file_name)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found or expired.")
     media_types = {
@@ -301,7 +369,7 @@ def download_file(file_id: str, fmt: str):
         "json": "application/json",
         "tallyxml": "application/xml"
     }
-    return FileResponse(file_path, media_type=media_types[fmt], filename=file_map[fmt])
+    return FileResponse(file_path, media_type=media_types[fmt], filename=file_name)
 
 @app.get("/")
 def root():
