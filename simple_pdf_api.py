@@ -10,7 +10,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import pdfplumber
 import pandas as pd
 import io
-
+ 
 # Directory to store temp files
 TEMP_DIR = "temp_files"
 if not os.path.exists(TEMP_DIR):
