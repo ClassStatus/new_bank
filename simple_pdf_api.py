@@ -24,7 +24,7 @@ app = FastAPI(
 )
 
 # Allowed frontend domains (add your production domain here later)
-ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost", "http://127.0.0.1:8000", "https://mywebsite.com"}  # Add your real domain
+ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost:8000", "http://127.0.0.1:8000", "https://mywebsite.com"}  # Add your real domain
 
 def check_origin(request: Request):
     origin = request.headers.get("origin") or request.headers.get("referer")
@@ -65,14 +65,32 @@ scheduler.start()
 # Helper: extract tables and save all formats
 SUPPORTED_FORMATS = ["html", "excel", "csv", "json", "tallyxml"]
 
-def extract_balances(tables):
-    # Try to find opening and closing balances from the first table
+def extract_balances(tables, unique_tables=None):
+    # If unique_tables is provided, use the largest merged table for balances
+    if unique_tables:
+        # Find the largest merged table (most rows)
+        merged = None
+        for dfs in unique_tables.values():
+            merged_df = pd.concat(dfs, ignore_index=True)
+            if merged is None or len(merged_df) > len(merged):
+                merged = merged_df
+        if merged is not None and not merged.empty:
+            # Try to find balance column
+            balance_col = None
+            for col in merged.columns:
+                if 'balance' in col.lower():
+                    balance_col = col
+                    break
+            if balance_col:
+                opening = merged[balance_col].iloc[0]
+                closing = merged[balance_col].iloc[-1]
+                return opening, closing
+    # Fallback: use first table
     if not tables:
         return None, None
     df = tables[0]['data']
     if df.empty:
         return None, None
-    # Try to find balance column
     balance_col = None
     for col in df.columns:
         if 'balance' in col.lower():
@@ -211,8 +229,8 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
     tally_xml = to_tally_xml(tables)
     with open(os.path.join(out_dir, "tables_tally.xml"), "w", encoding="utf-8") as f:
         f.write(tally_xml)
-    # Extract balances
-    opening, closing = extract_balances(tables)
+    # Extract balances (use merged tables for closing balance)
+    opening, closing = extract_balances(tables, unique_tables)
     return len(tables), len(non_blank_pages), opening, closing
 
 @app.post("/upload")
