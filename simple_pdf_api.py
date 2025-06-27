@@ -10,7 +10,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import pdfplumber
 import pandas as pd
 import io
- 
+
 # Directory to store temp files
 TEMP_DIR = "temp_files"
 if not os.path.exists(TEMP_DIR):
@@ -24,7 +24,7 @@ app = FastAPI(
 )
 
 # Allowed frontend domains (add your production domain here later)
-ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost", "http://127.0.0.1:8000", "https://mywebsite.com"}  # Add your real domain
+ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost:8000", "http://127.0.0.1:8000", "https://mywebsite.com"}  # Add your real domain
 
 def check_origin(request: Request):
     origin = request.headers.get("origin") or request.headers.get("referer")
@@ -63,7 +63,97 @@ scheduler.add_job(cleanup_temp_files, 'interval', seconds=CLEANUP_INTERVAL)
 scheduler.start()
 
 # Helper: extract tables and save all formats
-SUPPORTED_FORMATS = ["html", "excel", "csv", "json"]
+SUPPORTED_FORMATS = ["html", "excel", "csv", "json", "tallyxml"]
+
+def extract_balances(tables):
+    # Try to find opening and closing balances from the first table
+    if not tables:
+        return None, None
+    df = tables[0]['data']
+    if df.empty:
+        return None, None
+    # Try to find balance column
+    balance_col = None
+    for col in df.columns:
+        if 'balance' in col.lower():
+            balance_col = col
+            break
+    if balance_col:
+        opening = df[balance_col].iloc[0]
+        closing = df[balance_col].iloc[-1]
+        return opening, closing
+    return None, None
+
+def to_tally_xml(tables):
+    # Only use the first table for Tally export
+    if not tables:
+        return ""
+    df = tables[0]['data']
+    if df.empty:
+        return ""
+    # Try to find columns
+    date_col = None
+    desc_col = None
+    debit_col = None
+    credit_col = None
+    balance_col = None
+    for col in df.columns:
+        lcol = col.lower()
+        if not date_col and 'date' in lcol:
+            date_col = col
+        if not desc_col and ('desc' in lcol or 'particular' in lcol or 'narration' in lcol):
+            desc_col = col
+        if not debit_col and 'debit' in lcol:
+            debit_col = col
+        if not credit_col and 'credit' in lcol:
+            credit_col = col
+        if not balance_col and 'balance' in lcol:
+            balance_col = col
+    # Fallbacks
+    if not date_col:
+        date_col = df.columns[0]
+    if not desc_col:
+        desc_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+    # Build XML
+    xml = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<ENVELOPE>',
+        ' <HEADER>',
+        '  <TALLYREQUEST>Import Data</TALLYREQUEST>',
+        ' </HEADER>',
+        ' <BODY>',
+        '  <IMPORTDATA>',
+        '   <REQUESTDESC>',
+        '    <REPORTNAME>Vouchers</REPORTNAME>',
+        '   </REQUESTDESC>',
+        '   <REQUESTDATA>',
+    ]
+    for _, row in df.iterrows():
+        date_val = str(row[date_col]) if date_col in row else ''
+        desc_val = str(row[desc_col]) if desc_col in row else ''
+        debit_val = str(row[debit_col]) if debit_col and debit_col in row else ''
+        credit_val = str(row[credit_col]) if credit_col and credit_col in row else ''
+        balance_val = str(row[balance_col]) if balance_col and balance_col in row else ''
+        xml.append('    <TALLYMESSAGE>')
+        xml.append('     <VOUCHER VCHTYPE="Bank Statement" ACTION="Create">')
+        xml.append(f'      <DATE>{date_val}</DATE>')
+        xml.append(f'      <NARRATION>{desc_val}</NARRATION>')
+        if debit_val:
+            xml.append(f'      <DEBIT>{debit_val}</DEBIT>')
+        if credit_val:
+            xml.append(f'      <CREDIT>{credit_val}</CREDIT>')
+        if balance_val:
+            xml.append(f'      <BALANCE>{balance_val}</BALANCE>')
+        xml.append('     </VOUCHER>')
+        xml.append('    </TALLYMESSAGE>')
+    xml += [
+        '   </REQUESTDATA>',
+        '  </IMPORTDATA>',
+        ' </BODY>',
+        '</ENVELOPE>'
+    ]
+    return '\n'.join(xml)
+
 def extract_and_save(pdf_bytes, out_dir, password=None):
     tables = []
     unique_tables = {}  # key: tuple(headers), value: list of DataFrames
@@ -88,7 +178,7 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
     except Exception as e:
         raise e
     if not tables:
-        return 0, 0
+        return 0, 0, None, None
     # Save HTML (only tables, no extra text)
     html = ""
     for i, t in enumerate(tables):
@@ -117,7 +207,13 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
     import json
     with open(os.path.join(out_dir, "tables.json"), "w", encoding="utf-8") as f:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
-    return len(tables), len(non_blank_pages)
+    # Save Tally XML
+    tally_xml = to_tally_xml(tables)
+    with open(os.path.join(out_dir, "tables_tally.xml"), "w", encoding="utf-8") as f:
+        f.write(tally_xml)
+    # Extract balances
+    opening, closing = extract_balances(tables)
+    return len(tables), len(non_blank_pages), opening, closing
 
 @app.post("/upload")
 async def upload_pdf(
@@ -137,7 +233,7 @@ async def upload_pdf(
         f.write(pdf_bytes)
     # Try to extract tables, handle password-protected PDFs
     try:
-        tables_found, pages_count = extract_and_save(pdf_bytes, out_dir, password=password)
+        tables_found, pages_count, opening_balance, closing_balance = extract_and_save(pdf_bytes, out_dir, password=password)
     except Exception as e:
         err_msg = str(e).lower()
         if "password" in err_msg or "encrypted" in err_msg or "incorrect password" in err_msg:
@@ -160,7 +256,9 @@ async def upload_pdf(
         "tables_found": tables_found,
         "pages_count": pages_count,
         "file_id": file_id,
-        "download_links": links
+        "download_links": links,
+        "opening_balance": opening_balance,
+        "closing_balance": closing_balance
     }
 
 @app.get("/download/{file_id}/{fmt}")
@@ -172,7 +270,8 @@ def download_file(file_id: str, fmt: str):
         "html": "tables.html",
         "excel": "tables.xlsx",
         "csv": "tables.csv",
-        "json": "tables.json"
+        "json": "tables.json",
+        "tallyxml": "tables_tally.xml"
     }
     file_path = os.path.join(TEMP_DIR, safe_id, file_map[fmt])
     if not os.path.exists(file_path):
@@ -181,7 +280,8 @@ def download_file(file_id: str, fmt: str):
         "html": "text/html",
         "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "csv": "text/csv",
-        "json": "application/json"
+        "json": "application/json",
+        "tallyxml": "application/xml"
     }
     return FileResponse(file_path, media_type=media_types[fmt], filename=file_map[fmt])
 
