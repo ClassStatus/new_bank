@@ -3,7 +3,7 @@ import shutil
 import uuid
 import time
 from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Depends
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -23,9 +23,19 @@ app = FastAPI(
     version="2.0.0-prod"
 )
 
+# Allowed frontend domains (add your production domain here later)
+ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost:8000", "http://127.0.0.1:8000", "https://mywebsite.com"}  # Add your real domain
+
+def check_origin(request: Request):
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        raise HTTPException(status_code=403, detail="No origin header.")
+    if not any(origin.startswith(allowed) for allowed in ALLOWED_ORIGINS):
+        raise HTTPException(status_code=403, detail="Origin not allowed.")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(ALLOWED_ORIGINS),  # Allow localhost and your domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,8 +66,10 @@ scheduler.start()
 SUPPORTED_FORMATS = ["html", "excel", "csv", "json"]
 def extract_and_save(pdf_bytes, out_dir, password=None):
     tables = []
+    pages_count = 0
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
+            pages_count = len(pdf.pages)
             for page_num, page in enumerate(pdf.pages, 1):
                 for table in page.find_tables():
                     data = table.extract()
@@ -65,15 +77,13 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
                         df = pd.DataFrame(data[1:], columns=data[0])
                         tables.append({"page": page_num, "data": df})
     except Exception as e:
-        # If password is required or wrong, propagate error
         raise e
     if not tables:
-        return 0
-    # Save HTML
-    html = "<html><body>"
+        return 0, pages_count
+    # Save HTML (only tables, no extra text)
+    html = ""
     for i, t in enumerate(tables):
-        html += f"<h3>Table {i+1} (Page {t['page']})</h3>" + t['data'].to_html(index=False, border=1)
-    html += "</body></html>"
+        html += t['data'].to_html(index=False, border=1)
     with open(os.path.join(out_dir, "tables.html"), "w", encoding="utf-8") as f:
         f.write(html)
     # Save Excel
@@ -83,7 +93,6 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
     # Save CSV (all tables in one file, separated by blank lines)
     with open(os.path.join(out_dir, "tables.csv"), "w", encoding="utf-8") as f:
         for i, t in enumerate(tables):
-            f.write(f"# Table {i+1} (Page {t['page']})\n")
             t['data'].to_csv(f, index=False)
             f.write("\n\n")
     # Save JSON
@@ -98,10 +107,15 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
     import json
     with open(os.path.join(out_dir, "tables.json"), "w", encoding="utf-8") as f:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
-    return len(tables)
+    return len(tables), pages_count
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...), password: str = Form(None)):
+async def upload_pdf(
+    file: UploadFile = File(...),
+    password: str = Form(None),
+    request: Request = None,
+    _: None = Depends(check_origin)
+):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
     pdf_bytes = await file.read()
@@ -113,9 +127,8 @@ async def upload_pdf(file: UploadFile = File(...), password: str = Form(None)):
         f.write(pdf_bytes)
     # Try to extract tables, handle password-protected PDFs
     try:
-        tables_found = extract_and_save(pdf_bytes, out_dir, password=password)
+        tables_found, pages_count = extract_and_save(pdf_bytes, out_dir, password=password)
     except Exception as e:
-        # Check for password protection error
         err_msg = str(e).lower()
         if "password" in err_msg or "encrypted" in err_msg or "incorrect password" in err_msg:
             shutil.rmtree(out_dir)
@@ -129,12 +142,13 @@ async def upload_pdf(file: UploadFile = File(...), password: str = Form(None)):
             return {"success": False, "message": f"PDF processing error: {msg}"}
     if tables_found == 0:
         shutil.rmtree(out_dir)
-        return {"success": False, "message": "No tables found in PDF."}
+        return {"success": False, "message": "No tables found in PDF.", "pages_count": pages_count}
     # Return download links
     links = {fmt: f"/download/{file_id}/{fmt}" for fmt in SUPPORTED_FORMATS}
     return {
         "success": True,
         "tables_found": tables_found,
+        "pages_count": pages_count,
         "file_id": file_id,
         "download_links": links
     }
