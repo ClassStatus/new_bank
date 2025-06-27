@@ -24,7 +24,7 @@ app = FastAPI(
 )
 
 # Allowed frontend domains (add your production domain here later)
-ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost:8000", "http://127.0.0.1:8000", "https://mywebsite.com","http://localhost/bank_cursor_two/"}  # Add your real domain
+ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost", "http://127.0.0.1:8000", "https://mywebsite.com","http://localhost/bank_cursor_two"}  # Add your real domain
 
 def check_origin(request: Request):
     origin = request.headers.get("origin") or request.headers.get("referer")
