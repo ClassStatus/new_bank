@@ -24,7 +24,7 @@ app = FastAPI(
 )
 
 # Allowed frontend domains (add your production domain here later)
-ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost", "http://127.0.0.1:8000", "https://mywebsite.com","http://localhost/bank_cursor_two"}  # Add your real domain
+ALLOWED_ORIGINS = {"http://localhost:3000", "http://localhost", "http://127.0.0.1:8000", "https://mywebsite.com"}  # Add your real domain
 
 def check_origin(request: Request):
     origin = request.headers.get("origin") or request.headers.get("referer")
@@ -66,20 +66,29 @@ scheduler.start()
 SUPPORTED_FORMATS = ["html", "excel", "csv", "json"]
 def extract_and_save(pdf_bytes, out_dir, password=None):
     tables = []
-    pages_count = 0
+    unique_tables = {}  # key: tuple(headers), value: list of DataFrames
+    non_blank_pages = set()
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
-            pages_count = len(pdf.pages)
             for page_num, page in enumerate(pdf.pages, 1):
+                found_table = False
                 for table in page.find_tables():
                     data = table.extract()
                     if data and len(data) > 1:
                         df = pd.DataFrame(data[1:], columns=data[0])
                         tables.append({"page": page_num, "data": df})
+                        # For CSV merging
+                        headers_key = tuple(df.columns)
+                        if headers_key not in unique_tables:
+                            unique_tables[headers_key] = []
+                        unique_tables[headers_key].append(df)
+                        found_table = True
+                if found_table:
+                    non_blank_pages.add(page_num)
     except Exception as e:
         raise e
     if not tables:
-        return 0, pages_count
+        return 0, 0
     # Save HTML (only tables, no extra text)
     html = ""
     for i, t in enumerate(tables):
@@ -90,10 +99,11 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
     with pd.ExcelWriter(os.path.join(out_dir, "tables.xlsx"), engine='xlsxwriter') as writer:
         for i, t in enumerate(tables):
             t['data'].to_excel(writer, sheet_name=f"Table_{i+1}_Page_{t['page']}", index=False)
-    # Save CSV (all tables in one file, separated by blank lines)
+    # Save CSV (merge tables with same headers)
     with open(os.path.join(out_dir, "tables.csv"), "w", encoding="utf-8") as f:
-        for i, t in enumerate(tables):
-            t['data'].to_csv(f, index=False)
+        for headers, dfs in unique_tables.items():
+            merged_df = pd.concat(dfs, ignore_index=True)
+            merged_df.to_csv(f, index=False)
             f.write("\n\n")
     # Save JSON
     json_data = []
@@ -107,7 +117,7 @@ def extract_and_save(pdf_bytes, out_dir, password=None):
     import json
     with open(os.path.join(out_dir, "tables.json"), "w", encoding="utf-8") as f:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
-    return len(tables), pages_count
+    return len(tables), len(non_blank_pages)
 
 @app.post("/upload")
 async def upload_pdf(
