@@ -177,37 +177,60 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
     unique_tables = {}  # key: tuple(headers), value: list of DataFrames
     non_blank_pages = set()
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                found_table = False
-                for table in page.find_tables():
-                    data = table.extract()
-                    if data and len(data) > 1:
-                        df = pd.DataFrame(data[1:], columns=data[0])
-                        tables.append({"page": page_num, "data": df})
-                        # For CSV merging
-                        headers_key = tuple(df.columns)
-                        if headers_key not in unique_tables:
-                            unique_tables[headers_key] = []
-                        unique_tables[headers_key].append(df)
-                        found_table = True
-                if found_table:
-                    non_blank_pages.add(page_num)
+        # Try to open the PDF
+        pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+        
+        # Check if PDF opened successfully
+        if pdf is None:
+            raise Exception("Failed to open PDF - may be password protected")
+        
+        # Check if we can access pages
+        if not hasattr(pdf, 'pages') or pdf.pages is None:
+            raise Exception("PDF appears to be password protected or corrupted")
+        
+        for page_num, page in enumerate(pdf.pages, 1):
+            if page is None:
+                continue
+            found_table = False
+            for table in page.find_tables():
+                data = table.extract()
+                if data and len(data) > 1:
+                    df = pd.DataFrame(data[1:], columns=data[0])
+                    tables.append({"page": page_num, "data": df})
+                    # For CSV merging
+                    headers_key = tuple(df.columns)
+                    if headers_key not in unique_tables:
+                        unique_tables[headers_key] = []
+                    unique_tables[headers_key].append(df)
+                    found_table = True
+            if found_table:
+                non_blank_pages.add(page_num)
+        
+        # Close the PDF
+        pdf.close()
+        
     except Exception as e:
+        # Clean up if PDF was opened
+        try:
+            if 'pdf' in locals() and pdf is not None:
+                pdf.close()
+        except:
+            pass
+            
         err_msg = str(e) if e is not None else "Unknown error"
         err_msg_lower = err_msg.lower() if err_msg else ""
-        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower:
-            shutil.rmtree(out_dir)
+        
+        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower or "protected" in err_msg_lower:
             if password:
-                return {"success": False, "message": "Incorrect PDF password."}
+                raise Exception("Incorrect PDF password")
             else:
-                return {"success": False, "message": "PDF is password protected. Please provide password."}
+                raise Exception("PDF is password protected")
         else:
-            shutil.rmtree(out_dir)
-            msg = err_msg or "Unknown error. File may be corrupted or unsupported, or password is incorrect."
-            return {"success": False, "message": f"PDF processing error: {msg}"}
+            raise Exception(f"PDF processing error: {err_msg}")
+    
     if not tables:
         return 0, 0, None, None
+    
     # Use file_map for output names if provided
     if file_map is None:
         file_map = {
@@ -217,22 +240,26 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
             "json": "tables.json",
             "tallyxml": "tables_tally.xml"
         }
+    
     # Save HTML (only tables, no extra text)
     html = ""
     for i, t in enumerate(tables):
         html += t['data'].to_html(index=False, border=1)
     with open(os.path.join(out_dir, file_map["html"]), "w", encoding="utf-8") as f:
         f.write(html)
+    
     # Save Excel
     with pd.ExcelWriter(os.path.join(out_dir, file_map["excel"]), engine='xlsxwriter') as writer:
         for i, t in enumerate(tables):
             t['data'].to_excel(writer, sheet_name=f"Table_{i+1}_Page_{t['page']}", index=False)
+    
     # Save CSV (merge tables with same headers)
     with open(os.path.join(out_dir, file_map["csv"]), "w", encoding="utf-8") as f:
         for headers, dfs in unique_tables.items():
             merged_df = pd.concat(dfs, ignore_index=True)
             merged_df.to_csv(f, index=False)
             f.write("\n\n")
+    
     # Save JSON
     json_data = []
     for i, t in enumerate(tables):
@@ -245,10 +272,12 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
     import json
     with open(os.path.join(out_dir, file_map["json"]), "w", encoding="utf-8") as f:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
+    
     # Save Tally XML
     tally_xml = to_tally_xml(tables)
     with open(os.path.join(out_dir, file_map["tallyxml"]), "w", encoding="utf-8") as f:
         f.write(tally_xml)
+    
     # Extract balances (use merged tables for closing balance)
     opening, closing = extract_balances(tables, unique_tables)
     return len(tables), len(non_blank_pages), opening, closing
@@ -295,17 +324,26 @@ async def upload_pdf(
         # Re-extract unique_tables for merged tables JSON
         tables = []
         unique_tables = {}
-        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                for table in page.find_tables():
-                    data = table.extract()
-                    if data and len(data) > 1:
-                        df = pd.DataFrame(data[1:], columns=data[0])
-                        tables.append({"page": page_num, "data": df})
-                        headers_key = tuple(df.columns)
-                        if headers_key not in unique_tables:
-                            unique_tables[headers_key] = []
-                        unique_tables[headers_key].append(df)
+        
+        # Open PDF again for merged tables JSON
+        pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+        if pdf is None or not hasattr(pdf, 'pages') or pdf.pages is None:
+            raise Exception("Failed to open PDF for merged tables extraction")
+        
+        for page_num, page in enumerate(pdf.pages, 1):
+            if page is None:
+                continue
+            for table in page.find_tables():
+                data = table.extract()
+                if data and len(data) > 1:
+                    df = pd.DataFrame(data[1:], columns=data[0])
+                    tables.append({"page": page_num, "data": df})
+                    headers_key = tuple(df.columns)
+                    if headers_key not in unique_tables:
+                        unique_tables[headers_key] = []
+                    unique_tables[headers_key].append(df)
+        
+        pdf.close()
         
         merged_tables_json = []
         for headers, dfs in unique_tables.items():
@@ -316,10 +354,17 @@ async def upload_pdf(
             })
             
     except Exception as e:
+        # Clean up if PDF was opened
+        try:
+            if 'pdf' in locals() and pdf is not None:
+                pdf.close()
+        except:
+            pass
+            
         err_msg = str(e) if e is not None else "Unknown error"
         err_msg_lower = err_msg.lower() if err_msg else ""
         
-        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower:
+        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower or "protected" in err_msg_lower:
             shutil.rmtree(out_dir)
             if password:
                 return {
