@@ -78,7 +78,7 @@ def extract_balances(tables, unique_tables=None):
             # Try to find balance column
             balance_col = None
             for col in merged.columns:
-                if 'balance' in col.lower():
+                if col is not None and 'balance' in str(col).lower():
                     balance_col = col
                     break
             if balance_col:
@@ -93,7 +93,7 @@ def extract_balances(tables, unique_tables=None):
         return None, None
     balance_col = None
     for col in df.columns:
-        if 'balance' in col.lower():
+        if col is not None and 'balance' in str(col).lower():
             balance_col = col
             break
     if balance_col:
@@ -116,7 +116,9 @@ def to_tally_xml(tables):
     credit_col = None
     balance_col = None
     for col in df.columns:
-        lcol = col.lower()
+        if col is None:
+            continue
+        lcol = str(col).lower()
         if not date_col and 'date' in lcol:
             date_col = col
         if not desc_col and ('desc' in lcol or 'particular' in lcol or 'narration' in lcol):
@@ -129,9 +131,9 @@ def to_tally_xml(tables):
             balance_col = col
     # Fallbacks
     if not date_col:
-        date_col = df.columns[0]
+        date_col = df.columns[0] if len(df.columns) > 0 else None
     if not desc_col:
-        desc_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+        desc_col = df.columns[1] if len(df.columns) > 1 else df.columns[0] if len(df.columns) > 0 else None
     # Build XML
     xml = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -147,8 +149,8 @@ def to_tally_xml(tables):
         '   <REQUESTDATA>',
     ]
     for _, row in df.iterrows():
-        date_val = str(row[date_col]) if date_col in row else ''
-        desc_val = str(row[desc_col]) if desc_col in row else ''
+        date_val = str(row[date_col]) if date_col and date_col in row else ''
+        desc_val = str(row[desc_col]) if desc_col and desc_col in row else ''
         debit_val = str(row[debit_col]) if debit_col and debit_col in row else ''
         credit_val = str(row[credit_col]) if credit_col and credit_col in row else ''
         balance_val = str(row[balance_col]) if balance_col and balance_col in row else ''
