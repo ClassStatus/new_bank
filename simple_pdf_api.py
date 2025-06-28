@@ -222,12 +222,32 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
         err_msg = str(e) if e is not None else "Unknown error"
         err_msg_lower = err_msg.lower() if err_msg else ""
         
-        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower or "protected" in err_msg_lower:
+        # More comprehensive password detection
+        password_keywords = [
+            "password", "encrypted", "incorrect password", "protected", 
+            "authentication", "security", "locked", "restricted",
+            "requires password", "password required", "access denied"
+        ]
+        
+        is_password_error = any(keyword in err_msg_lower for keyword in password_keywords)
+        
+        if is_password_error:
             if password:
                 raise Exception("Incorrect PDF password")
             else:
                 raise Exception("PDF is password protected")
         else:
+            # Try to detect if it's a password issue by attempting without password
+            if password is None:
+                try:
+                    # Try to open with empty string password to see if it's password protected
+                    test_pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password="")
+                    test_pdf.close()
+                except Exception as test_e:
+                    test_err = str(test_e).lower()
+                    if any(keyword in test_err for keyword in password_keywords):
+                        raise Exception("PDF is password protected")
+            
             raise Exception(f"PDF processing error: {err_msg}")
     
     if not tables:
