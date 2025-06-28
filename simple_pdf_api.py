@@ -194,7 +194,18 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
                 if found_table:
                     non_blank_pages.add(page_num)
     except Exception as e:
-        raise e
+        err_msg = str(e) if e is not None else "Unknown error"
+        err_msg_lower = err_msg.lower() if err_msg else ""
+        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower:
+            shutil.rmtree(out_dir)
+            if password:
+                return {"success": False, "message": "Incorrect PDF password."}
+            else:
+                return {"success": False, "message": "PDF is password protected. Please provide password."}
+        else:
+            shutil.rmtree(out_dir)
+            msg = err_msg or "Unknown error. File may be corrupted or unsupported, or password is incorrect."
+            return {"success": False, "message": f"PDF processing error: {msg}"}
     if not tables:
         return 0, 0, None, None
     # Use file_map for output names if provided
@@ -250,28 +261,37 @@ async def upload_pdf(
     _: None = Depends(check_origin)
 ):
     if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+        return {
+            "success": False, 
+            "error_code": "INVALID_FILE_TYPE",
+            "message": "Only PDF files are allowed. Please upload a PDF file.",
+            "details": "The uploaded file must have a .pdf extension."
+        }
+    
     pdf_bytes = await file.read()
     file_id = str(uuid.uuid4())
     out_dir = os.path.join(TEMP_DIR, file_id)
     os.makedirs(out_dir, exist_ok=True)
-    # Determine output file base name
+    
+    # Determine output file base name - use the uploaded file name
     base_name = os.path.splitext(file.filename)[0]
-    use_custom_name = base_name.lower() == 'zyx'
     file_map = {
-        "html": f"{base_name}.html" if use_custom_name else "tables.html",
-        "excel": f"{base_name}.xlsx" if use_custom_name else "tables.xlsx",
-        "csv": f"{base_name}.csv" if use_custom_name else "tables.csv",
-        "json": f"{base_name}.json" if use_custom_name else "tables.json",
-        "tallyxml": f"{base_name}_tally.xml" if use_custom_name else "tables_tally.xml"
+        "html": f"{base_name}.html",
+        "excel": f"{base_name}.xlsx", 
+        "csv": f"{base_name}.csv",
+        "json": f"{base_name}.json",
+        "tallyxml": f"{base_name}_tally.xml"
     }
+    
     # Save original PDF
     with open(os.path.join(out_dir, "original.pdf"), "wb") as f:
         f.write(pdf_bytes)
+    
     # Try to extract tables, handle password-protected PDFs
     try:
         tables_found, pages_count, opening_balance, closing_balance = extract_and_save(
             pdf_bytes, out_dir, password=password, file_map=file_map)
+        
         # Re-extract unique_tables for merged tables JSON
         tables = []
         unique_tables = {}
@@ -286,6 +306,7 @@ async def upload_pdf(
                         if headers_key not in unique_tables:
                             unique_tables[headers_key] = []
                         unique_tables[headers_key].append(df)
+        
         merged_tables_json = []
         for headers, dfs in unique_tables.items():
             merged_df = pd.concat(dfs, ignore_index=True)
@@ -293,21 +314,62 @@ async def upload_pdf(
                 "columns": list(merged_df.columns),
                 "rows": merged_df.to_dict(orient="records")
             })
+            
     except Exception as e:
-        err_msg = str(e).lower()
-        if "password" in err_msg or "encrypted" in err_msg or "incorrect password" in err_msg:
+        err_msg = str(e) if e is not None else "Unknown error"
+        err_msg_lower = err_msg.lower() if err_msg else ""
+        
+        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower:
             shutil.rmtree(out_dir)
             if password:
-                return {"success": False, "message": "Incorrect PDF password."}
+                return {
+                    "success": False,
+                    "error_code": "INCORRECT_PASSWORD", 
+                    "message": "The provided password is incorrect.",
+                    "details": "Please check your password and try again."
+                }
             else:
-                return {"success": False, "message": "PDF is password protected. Please provide password."}
+                return {
+                    "success": False,
+                    "error_code": "PASSWORD_REQUIRED",
+                    "message": "This PDF is password protected.",
+                    "details": "Please provide the password to extract tables."
+                }
+        elif "corrupted" in err_msg_lower or "damaged" in err_msg_lower:
+            shutil.rmtree(out_dir)
+            return {
+                "success": False,
+                "error_code": "CORRUPTED_FILE",
+                "message": "The PDF file appears to be corrupted or damaged.",
+                "details": "Please try uploading a different PDF file."
+            }
+        elif "unsupported" in err_msg_lower or "format" in err_msg_lower:
+            shutil.rmtree(out_dir)
+            return {
+                "success": False,
+                "error_code": "UNSUPPORTED_FORMAT",
+                "message": "This PDF format is not supported.",
+                "details": "Please try with a different PDF file."
+            }
         else:
             shutil.rmtree(out_dir)
-            msg = str(e) or "Unknown error. File may be corrupted or unsupported, or password is incorrect."
-            return {"success": False, "message": f"PDF processing error: {msg}"}
+            return {
+                "success": False,
+                "error_code": "PROCESSING_ERROR",
+                "message": "Failed to process the PDF file.",
+                "details": f"Error: {err_msg}"
+            }
+    
     if tables_found == 0:
         shutil.rmtree(out_dir)
-        return {"success": False, "message": "No tables found in PDF.", "pages_count": pages_count}
+        return {
+            "success": False,
+            "error_code": "NO_TABLES_FOUND",
+            "message": "No tables found in the PDF.",
+            "details": f"Processed {pages_count} pages but found no extractable tables.",
+            "pages_count": pages_count
+        }
+    
     # Return download links
     links = {fmt: f"/download/{file_id}/{fmt}" for fmt in SUPPORTED_FORMATS}
     return {
@@ -326,42 +388,43 @@ async def upload_pdf(
 def download_file(file_id: str, fmt: str):
     if fmt not in SUPPORTED_FORMATS:
         raise HTTPException(status_code=400, detail="Invalid format.")
+    
     safe_id = file_id.replace("..", "")  # Prevent path traversal
-    # Try to find the file name from the output directory
     out_dir = os.path.join(TEMP_DIR, safe_id)
-    # Look for a file with the right extension and base name
+    
+    if not os.path.exists(out_dir):
+        raise HTTPException(status_code=404, detail="File not found or expired.")
+    
+    # Look for files in the directory
+    files = os.listdir(out_dir)
+    file_name = None
+    
+    # Try to find the file with the right extension
     ext_map = {
         "html": ".html",
-        "excel": ".xlsx",
+        "excel": ".xlsx", 
         "csv": ".csv",
         "json": ".json",
         "tallyxml": "_tally.xml"
     }
-    # Prefer zyx.* if present, else fallback
-    files = os.listdir(out_dir) if os.path.exists(out_dir) else []
-    file_name = None
+    
+    # Find the file with the correct extension
     for f in files:
-        if fmt == "tallyxml":
-            if f.endswith(ext_map[fmt]):
-                file_name = f
-                break
-        else:
-            if f.endswith(ext_map[fmt]) and (f.startswith("zyx") or f == f"tables{ext_map[fmt]}"):
-                file_name = f
-                break
+        if fmt == "tallyxml" and f.endswith(ext_map[fmt]):
+            file_name = f
+            break
+        elif f.endswith(ext_map[fmt]):
+            file_name = f
+            break
+    
     if not file_name:
-        # fallback to default
-        file_map = {
-            "html": "tables.html",
-            "excel": "tables.xlsx",
-            "csv": "tables.csv",
-            "json": "tables.json",
-            "tallyxml": "tables_tally.xml"
-        }
-        file_name = file_map[fmt]
+        raise HTTPException(status_code=404, detail="Requested format not found.")
+    
     file_path = os.path.join(out_dir, file_name)
+    
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found or expired.")
+    
     media_types = {
         "html": "text/html",
         "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -369,6 +432,7 @@ def download_file(file_id: str, fmt: str):
         "json": "application/json",
         "tallyxml": "application/xml"
     }
+    
     return FileResponse(file_path, media_type=media_types[fmt], filename=file_name)
 
 @app.get("/")
