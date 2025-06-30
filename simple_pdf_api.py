@@ -227,16 +227,7 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
         err_msg = str(e) if e is not None else "Unknown error"
         err_msg_lower = err_msg.lower() if err_msg else ""
         
-        # More comprehensive password detection
-        password_keywords = [
-            "password", "encrypted", "incorrect password", "protected", 
-            "authentication", "security", "locked", "restricted",
-            "requires password", "password required", "access denied"
-        ]
-        
-        is_password_error = any(keyword in err_msg_lower for keyword in password_keywords)
-        
-        if is_password_error:
+        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower or "protected" in err_msg_lower:
             if password:
                 raise Exception("Incorrect PDF password")
             else:
@@ -250,13 +241,13 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
                     test_pdf.close()
                 except Exception as test_e:
                     test_err = str(test_e).lower()
-                    if any(keyword in test_err for keyword in password_keywords):
+                    if any(keyword in test_err for keyword in ["password", "encrypted", "protected"]):
                         raise Exception("PDF is password protected")
             
             raise Exception(f"PDF processing error: {err_msg}")
     
     if not tables:
-        # Try OCR extraction
+        # Try OCR extraction only if no tables found in normal flow
         ocr_used = True
         ocr_tables = deep_table_extract(pdf_bytes)
         if ocr_tables and len(ocr_tables) > 0:
@@ -429,45 +420,23 @@ async def upload_pdf(
         err_msg_lower = err_msg.lower() if err_msg else ""
         
         if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower or "protected" in err_msg_lower:
-            shutil.rmtree(out_dir)
             if password:
-                return {
-                    "success": False,
-                    "error_code": "INCORRECT_PASSWORD", 
-                    "message": "The provided password is incorrect.",
-                    "details": "Please check your password and try again."
-                }
+                raise Exception("Incorrect PDF password")
             else:
-                return {
-                    "success": False,
-                    "error_code": "PASSWORD_REQUIRED",
-                    "message": "This PDF is password protected.",
-                    "details": "Please provide the password to extract tables."
-                }
-        elif "corrupted" in err_msg_lower or "damaged" in err_msg_lower:
-            shutil.rmtree(out_dir)
-            return {
-                "success": False,
-                "error_code": "CORRUPTED_FILE",
-                "message": "The PDF file appears to be corrupted or damaged.",
-                "details": "Please try uploading a different PDF file."
-            }
-        elif "unsupported" in err_msg_lower or "format" in err_msg_lower:
-            shutil.rmtree(out_dir)
-            return {
-                "success": False,
-                "error_code": "UNSUPPORTED_FORMAT",
-                "message": "This PDF format is not supported.",
-                "details": "Please try with a different PDF file."
-            }
+                raise Exception("PDF is password protected")
         else:
-            shutil.rmtree(out_dir)
-            return {
-                "success": False,
-                "error_code": "PROCESSING_ERROR",
-                "message": "Failed to process the PDF file.",
-                "details": f"Error: {err_msg}"
-            }
+            # Try to detect if it's a password issue by attempting without password
+            if password is None:
+                try:
+                    # Try to open with empty string password to see if it's password protected
+                    test_pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password="")
+                    test_pdf.close()
+                except Exception as test_e:
+                    test_err = str(test_e).lower()
+                    if any(keyword in test_err for keyword in ["password", "encrypted", "protected"]):
+                        raise Exception("PDF is password protected")
+            
+            raise Exception(f"PDF processing error: {err_msg}")
     
     if tables_found == 0:
         shutil.rmtree(out_dir)
