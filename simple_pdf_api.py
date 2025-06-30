@@ -10,9 +10,18 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import pdfplumber
 import pandas as pd
 import io
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), 'new'))
-from deep_table_extract import deep_table_extract
+
+# Try to import deep_table_extract, with fallback
+try:
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), 'new'))
+    from deep_table_extract import deep_table_extract
+    OCR_AVAILABLE = True
+except ImportError:
+    # Fallback function if OCR is not available
+    def deep_table_extract(pdf_bytes):
+        return []
+    OCR_AVAILABLE = False
 
 # Directory to store temp files
 TEMP_DIR = "temp_files"
@@ -249,38 +258,42 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
     if not tables:
         # Try OCR extraction only if no tables found in normal flow
         ocr_used = True
-        ocr_tables = deep_table_extract(pdf_bytes)
-        if ocr_tables and len(ocr_tables) > 0:
-            # Save OCR tables as HTML/Excel/CSV/JSON
-            html = ""
-            for i, df in enumerate(ocr_tables):
-                html += df.to_html(index=False, border=1)
-            with open(os.path.join(out_dir, file_map["html"]), "w", encoding="utf-8") as f:
-                f.write(html)
-            with pd.ExcelWriter(os.path.join(out_dir, file_map["excel"]), engine='xlsxwriter') as writer:
+        if OCR_AVAILABLE:
+            ocr_tables = deep_table_extract(pdf_bytes)
+            if ocr_tables and len(ocr_tables) > 0:
+                # Save OCR tables as HTML/Excel/CSV/JSON
+                html = ""
                 for i, df in enumerate(ocr_tables):
-                    df.to_excel(writer, sheet_name=f"OCR_Table_{i+1}", index=False)
-            with open(os.path.join(out_dir, file_map["csv"]), "w", encoding="utf-8") as f:
-                for df in ocr_tables:
-                    df.to_csv(f, index=False)
-                    f.write("\n\n")
-            json_data = []
-            for i, df in enumerate(ocr_tables):
-                json_data.append({
-                    "table": i+1,
-                    "columns": list(df.columns),
-                    "rows": df.to_dict(orient='records')
-                })
-            import json
-            with open(os.path.join(out_dir, file_map["json"]), "w", encoding="utf-8") as f:
-                json.dump(json_data, f, ensure_ascii=False, indent=2)
-            # No Tally XML for OCR
-            with open(os.path.join(out_dir, file_map["tallyxml"]), "w", encoding="utf-8") as f:
-                f.write("<!-- OCR se Tally XML generate nahi kiya gaya -->")
-            ocr_message = f"Yeh PDF image-based tha. OCR se {len(ocr_tables)} table mil gayi. Data thoda galat bhi ho sakta hai."
-            return len(ocr_tables), 0, None, None, ocr_used, ocr_message
+                    html += df.to_html(index=False, border=1)
+                with open(os.path.join(out_dir, file_map["html"]), "w", encoding="utf-8") as f:
+                    f.write(html)
+                with pd.ExcelWriter(os.path.join(out_dir, file_map["excel"]), engine='xlsxwriter') as writer:
+                    for i, df in enumerate(ocr_tables):
+                        df.to_excel(writer, sheet_name=f"OCR_Table_{i+1}", index=False)
+                with open(os.path.join(out_dir, file_map["csv"]), "w", encoding="utf-8") as f:
+                    for df in ocr_tables:
+                        df.to_csv(f, index=False)
+                        f.write("\n\n")
+                json_data = []
+                for i, df in enumerate(ocr_tables):
+                    json_data.append({
+                        "table": i+1,
+                        "columns": list(df.columns),
+                        "rows": df.to_dict(orient='records')
+                    })
+                import json
+                with open(os.path.join(out_dir, file_map["json"]), "w", encoding="utf-8") as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                # No Tally XML for OCR
+                with open(os.path.join(out_dir, file_map["tallyxml"]), "w", encoding="utf-8") as f:
+                    f.write("<!-- OCR se Tally XML generate nahi kiya gaya -->")
+                ocr_message = f"Yeh PDF image-based tha. OCR se {len(ocr_tables)} table mil gayi. Data thoda galat bhi ho sakta hai."
+                return len(ocr_tables), 0, None, None, ocr_used, ocr_message
+            else:
+                ocr_message = "Yeh PDF image-based hai aur OCR se bhi koi table nahi mili. Shayad quality low hai ya table nahi hai."
+                return 0, 0, None, None, ocr_used, ocr_message
         else:
-            ocr_message = "Yeh PDF image-based hai aur OCR se bhi koi table nahi mili. Shayad quality low hai ya table nahi hai."
+            ocr_message = "OCR not available on this server. Cannot process image-based PDFs."
             return 0, 0, None, None, ocr_used, ocr_message
     
     if not tables:
