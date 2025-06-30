@@ -32,4 +32,4 @@ RUN mkdir -p temp_files
 EXPOSE 8000
 
 # Run the application
-CMD ["uvicorn", "new.simple_pdf_api_prod:app", "--host", "0.0.0.0", "--port", "8000"] 
+CMD ["uvicorn", "new.simple_pdf_api_prod:app", "--host", "0.0.0.0", "--port", "8000"]
