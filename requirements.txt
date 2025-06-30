@@ -5,3 +5,9 @@ pandas
 xlsxwriter 
 python-multipart
 apscheduler 
+
+openpyxl
+python-dotenv
+slowapi
+python-dateutil
+tzlocal
