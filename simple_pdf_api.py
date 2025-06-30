@@ -453,42 +453,59 @@ async def upload_pdf(
                     return {
                         "success": False,
                         "error_code": "INCORRECT_PASSWORD", 
-                        "message": "The provided password is incorrect.",
-                        "details": "Please check your password and try again."
+                        "message": "❌ Incorrect Password",
+                        "details": "The password you provided is wrong. Please check and try again with the correct password."
                     }
                 else:
                     return {
                         "success": False,
                         "error_code": "PASSWORD_REQUIRED",
-                        "message": "This PDF is password protected.",
-                        "details": "Please provide the password to extract tables."
+                        "message": "🔒 Password Required",
+                        "details": "This PDF is password protected. Please enter the password to extract tables."
                     }
             elif "corrupted" in err_msg_lower or "damaged" in err_msg_lower:
                 shutil.rmtree(out_dir)
                 return {
                     "success": False,
                     "error_code": "CORRUPTED_FILE",
-                    "message": "The PDF file appears to be corrupted or damaged.",
-                    "details": "Please try uploading a different PDF file."
+                    "message": "⚠️ File Corrupted",
+                    "details": "The PDF file appears to be corrupted or damaged. Please try uploading a different file."
+                }
+            elif "unsupported" in err_msg_lower or "format" in err_msg_lower:
+                shutil.rmtree(out_dir)
+                return {
+                    "success": False,
+                    "error_code": "UNSUPPORTED_FORMAT",
+                    "message": "📄 Format Not Supported",
+                    "details": "This PDF format is not supported. Please try with a different PDF file."
                 }
             else:
                 shutil.rmtree(out_dir)
                 return {
                     "success": False,
                     "error_code": "PROCESSING_ERROR",
-                    "message": "Failed to process the PDF file.",
-                    "details": f"Error: {err_msg}"
+                    "message": "❌ Processing Failed",
+                    "details": f"Failed to process the PDF file. Error: {err_msg}"
                 }
         
         if tables_found == 0:
             shutil.rmtree(out_dir)
-            return {
-                "success": False,
-                "error_code": "NO_TABLES_FOUND",
-                "message": ocr_message if ocr_used else "No tables found in the PDF.",
-                "details": f"Processed {pages_count} pages but found no extractable tables.",
-                "pages_count": pages_count
-            }
+            if ocr_used:
+                return {
+                    "success": False,
+                    "error_code": "NO_TABLES_FOUND",
+                    "message": "🔍 No Tables Found",
+                    "details": ocr_message if ocr_message else "No tables could be extracted from this PDF, even with OCR.",
+                    "pages_count": pages_count
+                }
+            else:
+                return {
+                    "success": False,
+                    "error_code": "NO_TABLES_FOUND",
+                    "message": "📋 No Tables Found",
+                    "details": f"Processed {pages_count} pages but found no extractable tables. This PDF might be image-based or contain no tabular data.",
+                    "pages_count": pages_count
+                }
         
         # Return download links
         links = {fmt: f"/download/{file_id}/{fmt}" for fmt in SUPPORTED_FORMATS}
