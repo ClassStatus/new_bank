@@ -8,4 +8,5 @@ opencv-python
 pytesseract
 pdf2image
 Pillow
-numpy 
+numpy
+python-multipart
