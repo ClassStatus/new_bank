@@ -17,10 +17,24 @@ try:
     sys.path.append(os.path.join(os.path.dirname(__file__), 'new'))
     from deep_table_extract import deep_table_extract
     OCR_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    print(f"OCR import failed: {e}")
     # Fallback function if OCR is not available
     def deep_table_extract(pdf_bytes):
         return []
+    OCR_AVAILABLE = False
+
+# Try to import required OCR dependencies
+try:
+    import cv2
+    import numpy as np
+    from pdf2image import convert_from_bytes
+    from PIL import Image
+    import pytesseract
+    OCR_DEPS_AVAILABLE = True
+except ImportError as e:
+    print(f"OCR dependencies missing: {e}")
+    OCR_DEPS_AVAILABLE = False
     OCR_AVAILABLE = False
 
 # Directory to store temp files
@@ -357,113 +371,139 @@ async def upload_pdf(
     request: Request = None,
     _: None = Depends(check_origin)
 ):
-    if not file.filename.lower().endswith('.pdf'):
-        return {
-            "success": False, 
-            "error_code": "INVALID_FILE_TYPE",
-            "message": "Only PDF files are allowed. Please upload a PDF file.",
-            "details": "The uploaded file must have a .pdf extension."
-        }
-    
-    pdf_bytes = await file.read()
-    file_id = str(uuid.uuid4())
-    out_dir = os.path.join(TEMP_DIR, file_id)
-    os.makedirs(out_dir, exist_ok=True)
-    
-    # Determine output file base name - use the uploaded file name
-    base_name = os.path.splitext(file.filename)[0]
-    file_map = {
-        "html": f"{base_name}.html",
-        "excel": f"{base_name}.xlsx", 
-        "csv": f"{base_name}.csv",
-        "json": f"{base_name}.json",
-        "tallyxml": f"{base_name}_tally.xml"
-    }
-    
-    # Save original PDF
-    with open(os.path.join(out_dir, "original.pdf"), "wb") as f:
-        f.write(pdf_bytes)
-    
-    # Try to extract tables, handle password-protected PDFs
     try:
-        tables_found, pages_count, opening_balance, closing_balance, ocr_used, ocr_message = extract_and_save(
-            pdf_bytes, out_dir, password=password, file_map=file_map)
+        if not file.filename.lower().endswith('.pdf'):
+            return {
+                "success": False, 
+                "error_code": "INVALID_FILE_TYPE",
+                "message": "Only PDF files are allowed. Please upload a PDF file.",
+                "details": "The uploaded file must have a .pdf extension."
+            }
         
-        # Re-extract unique_tables for merged tables JSON
-        tables = []
-        unique_tables = {}
+        pdf_bytes = await file.read()
+        file_id = str(uuid.uuid4())
+        out_dir = os.path.join(TEMP_DIR, file_id)
+        os.makedirs(out_dir, exist_ok=True)
         
-        # Open PDF again for merged tables JSON
-        pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
-        if pdf is None or not hasattr(pdf, 'pages') or pdf.pages is None:
-            raise Exception("Failed to open PDF for merged tables extraction")
-        
-        for page_num, page in enumerate(pdf.pages, 1):
-            if page is None:
-                continue
-            for table in page.find_tables():
-                data = table.extract()
-                if data and len(data) > 1:
-                    df = pd.DataFrame(data[1:], columns=data[0])
-                    tables.append({"page": page_num, "data": df})
-                    headers_key = tuple(df.columns)
-                    if headers_key not in unique_tables:
-                        unique_tables[headers_key] = []
-                    unique_tables[headers_key].append(df)
-        
-        pdf.close()
-        
-        merged_tables_json = []
-        for headers, dfs in unique_tables.items():
-            merged_df = pd.concat(dfs, ignore_index=True)
-            merged_tables_json.append({
-                "columns": list(merged_df.columns),
-                "rows": merged_df.to_dict(orient="records")
-            })
-            
-    except Exception as e:
-        # Clean up if PDF was opened
-        try:
-            if 'pdf' in locals() and pdf is not None:
-                pdf.close()
-        except:
-            pass
-            
-        err_msg = str(e) if e is not None else "Unknown error"
-        err_msg_lower = err_msg.lower() if err_msg else ""
-        
-        if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower or "protected" in err_msg_lower:
-            if password:
-                raise Exception("Incorrect PDF password")
-            else:
-                raise Exception("PDF is password protected")
-        else:
-            # Try to detect if it's a password issue by attempting without password
-            if password is None:
-                try:
-                    # Try to open with empty string password to see if it's password protected
-                    test_pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password="")
-                    test_pdf.close()
-                except Exception as test_e:
-                    test_err = str(test_e).lower()
-                    if any(keyword in test_err for keyword in ["password", "encrypted", "protected"]):
-                        raise Exception("PDF is password protected")
-            
-            raise Exception(f"PDF processing error: {err_msg}")
-    
-    if tables_found == 0:
-        shutil.rmtree(out_dir)
-        return {
-            "success": False,
-            "error_code": "NO_TABLES_FOUND",
-            "message": ocr_message if ocr_used else "No tables found in the PDF.",
-            "details": f"Processed {pages_count} pages but found no extractable tables.",
-            "pages_count": pages_count
+        # Determine output file base name - use the uploaded file name
+        base_name = os.path.splitext(file.filename)[0]
+        file_map = {
+            "html": f"{base_name}.html",
+            "excel": f"{base_name}.xlsx", 
+            "csv": f"{base_name}.csv",
+            "json": f"{base_name}.json",
+            "tallyxml": f"{base_name}_tally.xml"
         }
-    
-    # Return download links
-    links = {fmt: f"/download/{file_id}/{fmt}" for fmt in SUPPORTED_FORMATS}
-    if ocr_used and ocr_message:
+        
+        # Save original PDF
+        with open(os.path.join(out_dir, "original.pdf"), "wb") as f:
+            f.write(pdf_bytes)
+        
+        # Try to extract tables, handle password-protected PDFs
+        try:
+            tables_found, pages_count, opening_balance, closing_balance, ocr_used, ocr_message = extract_and_save(
+                pdf_bytes, out_dir, password=password, file_map=file_map)
+            
+            # Re-extract unique_tables for merged tables JSON
+            tables = []
+            unique_tables = {}
+            
+            # Open PDF again for merged tables JSON
+            pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+            if pdf is None or not hasattr(pdf, 'pages') or pdf.pages is None:
+                raise Exception("Failed to open PDF for merged tables extraction")
+            
+            for page_num, page in enumerate(pdf.pages, 1):
+                if page is None:
+                    continue
+                for table in page.find_tables():
+                    data = table.extract()
+                    if data and len(data) > 1:
+                        df = pd.DataFrame(data[1:], columns=data[0])
+                        tables.append({"page": page_num, "data": df})
+                        headers_key = tuple(df.columns)
+                        if headers_key not in unique_tables:
+                            unique_tables[headers_key] = []
+                        unique_tables[headers_key].append(df)
+            
+            pdf.close()
+            
+            merged_tables_json = []
+            for headers, dfs in unique_tables.items():
+                merged_df = pd.concat(dfs, ignore_index=True)
+                merged_tables_json.append({
+                    "columns": list(merged_df.columns),
+                    "rows": merged_df.to_dict(orient="records")
+                })
+                
+        except Exception as e:
+            # Clean up if PDF was opened
+            try:
+                if 'pdf' in locals() and pdf is not None:
+                    pdf.close()
+            except:
+                pass
+                
+            err_msg = str(e) if e is not None else "Unknown error"
+            err_msg_lower = err_msg.lower() if err_msg else ""
+            
+            if "password" in err_msg_lower or "encrypted" in err_msg_lower or "incorrect password" in err_msg_lower or "protected" in err_msg_lower:
+                shutil.rmtree(out_dir)
+                if password:
+                    return {
+                        "success": False,
+                        "error_code": "INCORRECT_PASSWORD", 
+                        "message": "The provided password is incorrect.",
+                        "details": "Please check your password and try again."
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error_code": "PASSWORD_REQUIRED",
+                        "message": "This PDF is password protected.",
+                        "details": "Please provide the password to extract tables."
+                    }
+            elif "corrupted" in err_msg_lower or "damaged" in err_msg_lower:
+                shutil.rmtree(out_dir)
+                return {
+                    "success": False,
+                    "error_code": "CORRUPTED_FILE",
+                    "message": "The PDF file appears to be corrupted or damaged.",
+                    "details": "Please try uploading a different PDF file."
+                }
+            else:
+                shutil.rmtree(out_dir)
+                return {
+                    "success": False,
+                    "error_code": "PROCESSING_ERROR",
+                    "message": "Failed to process the PDF file.",
+                    "details": f"Error: {err_msg}"
+                }
+        
+        if tables_found == 0:
+            shutil.rmtree(out_dir)
+            return {
+                "success": False,
+                "error_code": "NO_TABLES_FOUND",
+                "message": ocr_message if ocr_used else "No tables found in the PDF.",
+                "details": f"Processed {pages_count} pages but found no extractable tables.",
+                "pages_count": pages_count
+            }
+        
+        # Return download links
+        links = {fmt: f"/download/{file_id}/{fmt}" for fmt in SUPPORTED_FORMATS}
+        if ocr_used and ocr_message:
+            return {
+                "success": True,
+                "tables_found": tables_found,
+                "pages_count": pages_count,
+                "file_id": file_id,
+                "download_links": links,
+                "output_file_names": file_map,
+                "opening_balance": opening_balance,
+                "closing_balance": closing_balance,
+                "ocr_message": ocr_message
+            }
         return {
             "success": True,
             "tables_found": tables_found,
@@ -473,19 +513,18 @@ async def upload_pdf(
             "output_file_names": file_map,
             "opening_balance": opening_balance,
             "closing_balance": closing_balance,
-            "ocr_message": ocr_message
+            "merged_tables_json": merged_tables_json
         }
-    return {
-        "success": True,
-        "tables_found": tables_found,
-        "pages_count": pages_count,
-        "file_id": file_id,
-        "download_links": links,
-        "output_file_names": file_map,
-        "opening_balance": opening_balance,
-        "closing_balance": closing_balance,
-        "merged_tables_json": merged_tables_json
-    }
+    except Exception as e:
+        print(f"Upload endpoint error: {e}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return {
+            "success": False,
+            "error_code": "SERVER_ERROR",
+            "message": "Internal server error occurred.",
+            "details": f"Error: {str(e)}"
+        }
 
 @app.get("/download/{file_id}/{fmt}")
 def download_file(file_id: str, fmt: str):
