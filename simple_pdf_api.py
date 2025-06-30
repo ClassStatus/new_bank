@@ -246,7 +246,37 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
         
         # Try to open the PDF
         logger.info("Attempting to open PDF")
-        pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+        logger.info(f"Password provided: {'Yes' if password else 'No'}")
+        
+        try:
+            pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+        except Exception as pdf_open_error:
+            logger.error(f"PDF open error: {pdf_open_error}")
+            # Check if it's a password issue
+            if password:
+                # Try without password to see if it's password protected
+                try:
+                    test_pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=None)
+                    test_pdf.close()
+                    raise Exception("Incorrect PDF password")
+                except Exception as test_error:
+                    test_err_msg = str(test_error).lower()
+                    if any(keyword in test_err_msg for keyword in ["password", "encrypted", "protected"]):
+                        raise Exception("Incorrect PDF password")
+                    else:
+                        raise Exception(f"PDF open failed: {pdf_open_error}")
+            else:
+                # No password provided, check if it's password protected
+                try:
+                    test_pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password="")
+                    test_pdf.close()
+                    raise Exception("PDF is password protected")
+                except Exception as test_error:
+                    test_err_msg = str(test_error).lower()
+                    if any(keyword in test_err_msg for keyword in ["password", "encrypted", "protected"]):
+                        raise Exception("PDF is password protected")
+                    else:
+                        raise Exception(f"PDF open failed: {pdf_open_error}")
         
         # Check if PDF opened successfully
         if pdf is None:
@@ -294,6 +324,7 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
         err_msg_lower = err_msg.lower() if err_msg else ""
         
         logger.error(f"PDF processing error: {err_msg}")
+        logger.error(f"Error type: {type(e).__name__}")
         
         # Check for specific error types
         if any(keyword in err_msg_lower for keyword in ["password", "encrypted", "incorrect password", "protected"]):
@@ -684,4 +715,61 @@ def download_file(file_id: str, fmt: str):
 
 @app.get("/")
 def root():
-    return {"message": "Production PDF Table Extractor API. POST /upload with PDF, get download links."} 
+    return {"message": "Production PDF Table Extractor API. POST /upload with PDF, get download links."}
+
+@app.post("/test-pdf")
+async def test_pdf(
+    file: UploadFile = File(...),
+    password: str = Form(None)
+):
+    """Test endpoint to debug PDF issues"""
+    try:
+        logger.info(f"Test request for file: {file.filename}")
+        
+        if not file.filename.lower().endswith('.pdf'):
+            return {"error": "Not a PDF file"}
+        
+        pdf_bytes = await file.read()
+        logger.info(f"File size: {len(pdf_bytes)} bytes")
+        
+        # Test without password
+        try:
+            pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=None)
+            pdf.close()
+            return {"status": "PDF opens without password", "password_protected": False}
+        except Exception as e1:
+            logger.info(f"Without password error: {e1}")
+            
+            # Test with empty password
+            try:
+                pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password="")
+                pdf.close()
+                return {"status": "PDF opens with empty password", "password_protected": False}
+            except Exception as e2:
+                logger.info(f"With empty password error: {e2}")
+                
+                # Test with provided password
+                if password:
+                    try:
+                        pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+                        pdf.close()
+                        return {"status": "PDF opens with provided password", "password_protected": True, "password_correct": True}
+                    except Exception as e3:
+                        logger.info(f"With provided password error: {e3}")
+                        return {
+                            "status": "PDF is password protected but provided password is incorrect",
+                            "password_protected": True,
+                            "password_correct": False,
+                            "error": str(e3)
+                        }
+                else:
+                    return {
+                        "status": "PDF is password protected but no password provided",
+                        "password_protected": True,
+                        "password_correct": False,
+                        "error": str(e1)
+                    }
+                    
+    except Exception as e:
+        logger.error(f"Test endpoint error: {e}")
+        return {"error": str(e)} 
