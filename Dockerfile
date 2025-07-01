@@ -6,9 +6,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Update and install system dependencies
 RUN apt-get update && \
     apt-get install -y \
-        python3.11 \
-        python3.11-pip \
-        python3.11-dev \
+        python3 \
+        python3-pip \
+        python3-dev \
         tesseract-ocr \
         tesseract-ocr-hin \
         tesseract-ocr-eng \
@@ -21,10 +21,6 @@ RUN apt-get update && \
         libgomp1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-
-# Create symlinks for python
-RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
-    ln -sf /usr/bin/python3.11 /usr/bin/python
 
 # Set working directory
 WORKDIR /app
