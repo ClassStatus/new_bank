@@ -10,6 +10,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import pdfplumber
 import pandas as pd
 import io
+import sys
+import torch
+import numpy as np
+from PIL import Image
+from pdf2image import convert_from_bytes
+import pytesseract
+import re
 
 # Directory to store temp files
 TEMP_DIR = "temp_files"
@@ -284,11 +291,16 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None):
                     
             except Exception as ocr_e:
                 print(f"❌ OCR processing error: {ocr_e}")
-                ocr_message = f"❌ OCR processing failed: {str(ocr_e)}"
+                error_msg = str(ocr_e)
+                
+                if "tesseract is not installed" in error_msg.lower() or "tesseract ocr is not installed" in error_msg.lower():
+                    ocr_message = "❌ Tesseract OCR is not installed on this server. To process image-based PDFs, please install Tesseract OCR engine. Installation: https://github.com/tesseract-ocr/tesseract"
+                else:
+                    ocr_message = f"❌ OCR processing failed: {error_msg}"
                 return 0, 0, None, None, ocr_used, ocr_message
         else:
             print("❌ OCR not available")
-            ocr_message = "❌ OCR is not available on this server. Cannot process image-based PDFs."
+            ocr_message = "❌ OCR is not available on this server. Cannot process image-based PDFs. Please install required dependencies: opencv-python, pytesseract, pdf2image, Pillow"
             return 0, 0, None, None, ocr_used, ocr_message
     
     if not tables:
@@ -568,9 +580,7 @@ def root():
 
 # Try to import deep_table_extract, with fallback
 try:
-    import sys
-    sys.path.append(os.path.join(os.path.dirname(__file__), 'new'))
-    from deep_table_extract import deep_table_extract
+    from deep_table_extract import extract_tables_from_pdf as deep_table_extract
     OCR_AVAILABLE = True
     print("✅ OCR module loaded successfully")
 except Exception as e:
@@ -592,4 +602,112 @@ try:
 except ImportError as e:
     print(f"❌ OCR dependencies missing: {e}")
     OCR_DEPS_AVAILABLE = False
-    OCR_AVAILABLE = False 
+    OCR_AVAILABLE = False
+
+def detect_tables_cascadetabnet(model, image_np):
+    # image_np: numpy array (H, W, 3)
+    # Preprocess as in the CascadeTabNet repo
+    # Run model inference and post-process to get bounding boxes
+    # Return: list of (x1, y1, x2, y2)
+    # For full details, see CascadeTabNet's inference code:
+    # https://github.com/DevashishPrasad/CascadeTabNet/blob/master/inference.py
+    raise NotImplementedError("Integrate CascadeTabNet inference here (see official repo)")
+
+# Add CascadeTabNet repo to path
+sys.path.append(os.path.join(os.path.dirname(__file__), 'CascadeTabNet', 'Table Structure Recognition', 'Functions'))
+# Import your model class here (adjust as needed)
+# from model import CascadeTabNet
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'CascadeTabNet_Simple.pth')
+
+def load_cascadetabnet_model():
+    try:
+        # model = CascadeTabNet()
+        # model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
+        # model.eval()
+        # return model
+        raise NotImplementedError("You must implement model loading using the official CascadeTabNet repo.")
+    except Exception as e:
+        print(f"❌ Error loading CascadeTabNet model: {e}")
+        return None
+
+def detect_tables_cascadetabnet(model, image_np):
+    try:
+        # Implement inference using CascadeTabNet
+        # Return list of bounding boxes: [(x1, y1, x2, y2), ...]
+        raise NotImplementedError("You must implement CascadeTabNet inference using the official repo.")
+    except Exception as e:
+        print(f"❌ Error in CascadeTabNet inference: {e}")
+        return []
+
+def preprocess_for_ocr(img_pil):
+    img = np.array(img_pil.convert('RGB'))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    if gray.shape[0] < 1000:
+        gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.fastNlMeansDenoising(gray, h=30)
+    kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
+    gray = cv2.filter2D(gray, -1, kernel)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    coords = np.column_stack(np.where(binary > 0))
+    angle = cv2.minAreaRect(coords)[-1] if coords.shape[0] > 0 else 0
+    angle = -(90 + angle) if angle < -45 else -angle
+    (h, w) = binary.shape
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    binary = cv2.warpAffine(binary, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(binary)
+
+def extract_table_from_image(img_pil):
+    config = '--oem 1 --psm 6'
+    text = pytesseract.image_to_string(img_pil, config=config, lang='eng')
+    rows = [line.strip() for line in text.split('\n') if line.strip()]
+    data = []
+    for row in rows:
+        if '\t' in row:
+            cols = row.split('\t')
+        elif '  ' in row:
+            cols = re.split(r'\s{2,}', row)
+        else:
+            cols = re.split(r'[|,;]', row)
+        cols = [c.strip() for c in cols if c.strip()]
+        if cols:
+            data.append(cols)
+    if not data:
+        return pd.DataFrame()
+    max_cols = max(len(r) for r in data)
+    columns = [f'Column_{i+1}' for i in range(max_cols)]
+    df = pd.DataFrame(data, columns=columns)
+    return df
+
+def extract_tables_from_pdf(pdf_bytes):
+    images = convert_from_bytes(pdf_bytes, dpi=300)
+    all_tables = []
+    model = load_cascadetabnet_model()
+    for page_num, img_pil in enumerate(images, 1):
+        print(f"📄 Processing page {page_num}")
+        processed_img = preprocess_for_ocr(img_pil)
+        img_np = np.array(processed_img)
+        table_boxes = []
+        if model is not None:
+            try:
+                table_boxes = detect_tables_cascadetabnet(model, img_np)
+                print(f"[CascadeTabNet] Found {len(table_boxes)} tables on page {page_num}")
+            except Exception as e:
+                print(f"[CascadeTabNet] Detection failed: {e}. Using full page.")
+        if not table_boxes:
+            table_boxes = [(0, 0, img_np.shape[1], img_np.shape[0])]
+        for box_num, (x1, y1, x2, y2) in enumerate(table_boxes, 1):
+            crop = img_np[y1:y2, x1:x2]
+            crop_pil = Image.fromarray(crop)
+            df = extract_table_from_image(crop_pil)
+            if not df.empty:
+                print(f"✅ Table found in region {box_num} on page {page_num}, rows: {len(df)}")
+                all_tables.append({
+                    'table': len(all_tables)+1,
+                    'page': page_num,
+                    'columns': df.columns.tolist(),
+                    'rows': df.to_dict(orient='records')
+                })
+            else:
+                print(f"⚠️ No table found in region {box_num} on page {page_num}")
+    return all_tables 
