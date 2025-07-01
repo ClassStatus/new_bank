@@ -16,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app code
-COPY main.py .
+COPY simple_pdf_api.py .
 
 # Run FastAPI app with uvicorn
 CMD ["uvicorn", "simple_pdf_api:app", "--host", "0.0.0.0", "--port", "10000"]
