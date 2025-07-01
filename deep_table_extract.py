@@ -6,6 +6,7 @@ from PIL import Image
 import pandas as pd
 import re
 import traceback
+import camelot
 
 # Try to import pytesseract with fallback
 try:
@@ -43,6 +44,15 @@ except ImportError:
 
 # Path to CascadeTabNet weights (download from official repo)
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'CascadeTabNet_Simple.pth')
+
+# Try to import Camelot for digital PDF table extraction
+try:
+    import camelot
+    CAMELOT_AVAILABLE = True
+    print("✅ Camelot is available for table extraction")
+except ImportError:
+    CAMELOT_AVAILABLE = False
+    print("❌ Camelot is not available. Only OCR will be used for table extraction.")
 
 def preprocess_image(img_pil):
     try:
@@ -169,8 +179,42 @@ def extract_table_from_crop(crop_img):
         print(f"Error in table extraction: {e}")
         return pd.DataFrame()
 
+def extract_tables_with_camelot(pdf_bytes):
+    """Extract tables from PDF using Camelot. Returns list of DataFrames."""
+    import tempfile
+    import io
+    tables = []
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as tmp:
+        tmp.write(pdf_bytes)
+        tmp.flush()
+        print("🔍 [Camelot] Trying to extract tables from PDF using Camelot...")
+        try:
+            # Try both flavors for best results
+            tables_lattice = camelot.read_pdf(tmp.name, pages='all', flavor='lattice')
+            tables_stream = camelot.read_pdf(tmp.name, pages='all', flavor='stream')
+            all_tables = tables_lattice + tables_stream
+            print(f"✅ [Camelot] Found {len(all_tables)} tables in PDF.")
+            for t in all_tables:
+                if not t.df.empty:
+                    tables.append(t.df)
+            return tables
+        except Exception as e:
+            print(f"❌ [Camelot] Table extraction failed: {e}")
+            return []
+
 # Main function: PDF bytes -> list of DataFrames
+# Now tries Camelot first, then falls back to OCR
+
 def deep_table_extract(pdf_bytes):
+    # Try Camelot first
+    if CAMELOT_AVAILABLE:
+        tables = extract_tables_with_camelot(pdf_bytes)
+        if tables:
+            print(f"🎉 [Camelot] Table extraction complete. Found {len(tables)} tables.")
+            return tables
+        else:
+            print("⚠️ [Camelot] No tables found with Camelot. Falling back to OCR.")
+    # Fallback to OCR
     try:
         if not TESSERACT_AVAILABLE:
             print("❌ Tesseract OCR is not installed. Please install Tesseract OCR engine to process image-based PDFs.")
@@ -222,4 +266,10 @@ def load_cascadetabnet_model():
 
 def detect_tables_in_image(model, image_np):
     # Placeholder for CascadeTabNet model inference
-    return [] 
+    return []
+
+def extract_tables_with_camelot(pdf_path):
+    tables = camelot.read_pdf(pdf_path, pages='all', flavor='stream')  # or 'lattice'
+    for i, table in enumerate(tables):
+        print(f"Table {i+1}")
+        print(table.df) 
