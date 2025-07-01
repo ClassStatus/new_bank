@@ -1,13 +1,7 @@
 fastapi
 uvicorn
-pdfplumber
-pandas
-xlsxwriter
-python-multipart
-apscheduler
-camelot-py[cv]
-opencv-python
-paddlepaddle
 paddleocr
+paddlepaddle==2.5.2
 pdf2image
-pytesseract
+opencv-python-headless
+python-multipart
