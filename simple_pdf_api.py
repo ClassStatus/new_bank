@@ -11,7 +11,6 @@ import pdfplumber
 import pandas as pd
 import io
 import sys
-import torch
 import numpy as np
 from PIL import Image
 from pdf2image import convert_from_bytes
