@@ -220,8 +220,7 @@ def deep_table_extract(pdf_bytes):
             print("❌ Tesseract OCR is not installed. Please install Tesseract OCR engine to process image-based PDFs.")
             raise Exception("Tesseract OCR is not installed. Please install Tesseract OCR engine to process image-based PDFs.")
         print("🔄 [OCR] Converting PDF to images...")
-        import io
-        images = convert_from_bytes(io.BytesIO(pdf_bytes))
+        images = convert_from_bytes(pdf_bytes)
         print(f"📄 [OCR] Converted {len(images)} pages to images")
         all_tables = []
         for page_num, img_pil in enumerate(images, 1):
