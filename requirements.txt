@@ -9,3 +9,4 @@ camelot-py[cv]
 opencv-python
 paddlepaddle
 paddleocr
+pdf2image
