@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11
 
 # Update package lists and install system dependencies
 RUN apt-get update -qq && \
