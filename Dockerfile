@@ -31,6 +31,7 @@ WORKDIR /app
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir paddlepaddle paddleocr
 
 # Copy application code
 COPY . .
@@ -42,4 +43,4 @@ RUN mkdir -p temp_files
 EXPOSE 8000
 
 # Run the application
-CMD ["uvicorn", "simple_pdf_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "simple_pdf_api_prod:app", "--host", "0.0.0.0", "--port", "8000"]
