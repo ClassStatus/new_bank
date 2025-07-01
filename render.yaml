@@ -1,15 +1,10 @@
 services:
   - type: web
-    name: bank-statement-converter
-    env: python
-    buildCommand: chmod +x build.sh && ./build.sh
-    startCommand: uvicorn new.simple_pdf_api_prod:app --host 0.0.0.0 --port $PORT
+    name: pdf-ocr-fastapi
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: ./start.sh
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11
-      - key: PORT
-        value: 8000
-    plan: starter
-    region: oregon
-    healthCheckPath: /
-    autoDeploy: true 
+        value: 3.10
+    plan: free
