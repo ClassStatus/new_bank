@@ -1,14 +1,17 @@
-FROM ubuntu:22.04
+FROM python:3.11-slim
 
-# Prevent interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
+# Update package lists and install system dependencies
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release \
+    && rm -rf /var/lib/apt/lists/*
 
-# Update and install system dependencies
-RUN apt-get update && \
-    apt-get install -y \
-        python3 \
-        python3-pip \
-        python3-dev \
+# Install Tesseract and other dependencies
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
         tesseract-ocr \
         tesseract-ocr-hin \
         tesseract-ocr-eng \
@@ -19,6 +22,7 @@ RUN apt-get update && \
         libxext6 \
         libxrender-dev \
         libgomp1 \
+        libgthread-2.0-0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,7 +31,7 @@ WORKDIR /app
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
@@ -39,4 +43,4 @@ RUN mkdir -p temp_files
 EXPOSE 8000
 
 # Run the application
-CMD ["python3", "-m", "uvicorn", "new.simple_pdf_api_prod:app", "--host", "0.0.0.0", "--port", "8000"] 
+CMD ["uvicorn", "simple_pdf_api_prod:app", "--host", "0.0.0.0", "--port", "8000"]
