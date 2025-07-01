@@ -1,10 +1,7 @@
 services:
   - type: web
     name: pdf-ocr-fastapi
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: ./start.sh
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.10
+    runtime: docker
+    repo: https://github.com/ClassStatus/new_bank
+    branch: main
     plan: free
