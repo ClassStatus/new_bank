@@ -22,7 +22,6 @@ RUN apt-get update -qq && \
         libxext6 \
         libxrender-dev \
         libgomp1 \
-        libgthread-2.0-0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
