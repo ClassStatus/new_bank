@@ -1,212 +1,87 @@
-import os
 import cv2
 import numpy as np
-from pdf2image import convert_from_bytes
 from PIL import Image
+import pytesseract
 import pandas as pd
 import re
-import traceback
-from io import BytesIO
-import tempfile
-import platform
+from pdf2image import convert_from_bytes
 
-# Optional: Setup Tesseract
-try:
-    import pytesseract
-    TESSERACT_AVAILABLE = True
-    print("✅ Tesseract OCR is available")
+# Image Preprocessing Function
+def preprocess_for_ocr(img_pil):
+    img = np.array(img_pil.convert('RGB'))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    try:
-        pytesseract.get_tesseract_version()
-    except Exception:
-        if platform.system() == "Windows":
-            common_paths = [
-                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-                os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
-            ]
-            for path in common_paths:
-                if os.path.exists(path):
-                    pytesseract.pytesseract.tesseract_cmd = path
-                    print(f"✅ Found Tesseract at: {path}")
-                    break
-            else:
-                print("⚠️ Tesseract found but not in PATH. Add it or specify the path manually.")
-except ImportError:
-    TESSERACT_AVAILABLE = False
-    print("❌ Tesseract OCR is not available")
+    # Resize (Upscale small images)
+    if gray.shape[0] < 1000:
+        gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
 
-# Camelot for table extraction
-try:
-    import camelot
-    CAMELOT_AVAILABLE = True
-    print("✅ Camelot is available for table extraction")
-except ImportError:
-    CAMELOT_AVAILABLE = False
-    print("❌ Camelot is not available. Only OCR will be used.")
+    # Denoise
+    gray = cv2.fastNlMeansDenoising(gray, h=30)
 
-# Preprocess PIL Image
-def preprocess_image(img_pil):
-    try:
-        img = np.array(img_pil.convert('L'))  # grayscale
-        img = cv2.fastNlMeansDenoising(img, None, 30, 7, 21)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        img = clahe.apply(img)
-        _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Sharpening
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5,-1],
+                       [0, -1, 0]])
+    gray = cv2.filter2D(gray, -1, kernel)
 
-        # Deskew
-        coords = np.column_stack(np.where(img > 0))
-        angle = 0
-        if coords.shape[0] > 0:
-            rect = cv2.minAreaRect(coords)
-            angle = rect[-1]
-            angle = -(90 + angle) if angle < -45 else -angle
-            (h, w) = img.shape[:2]
-            M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    # Thresholding
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        return img
-    except Exception as e:
-        print(f"Error in image preprocessing: {e}")
-        return np.array(img_pil.convert('L'))
+    # Deskew
+    coords = np.column_stack(np.where(binary > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+    angle = -(90 + angle) if angle < -45 else -angle
+    (h, w) = binary.shape
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    binary = cv2.warpAffine(binary, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
-# OpenCV Table Detection
-def detect_tables_opencv(img):
-    try:
-        horizontal = img.copy()
-        vertical = img.copy()
-        scale = 20
-        horizontalsize = max(1, img.shape[1] // scale)
-        verticalsize = max(1, img.shape[0] // scale)
+    return Image.fromarray(binary)
 
-        horizontalStructure = cv2.getStructuringElement(cv2.MORPH_RECT, (horizontalsize, 1))
-        verticalStructure = cv2.getStructuringElement(cv2.MORPH_RECT, (1, verticalsize))
+# Extract Table from Preprocessed Image using OCR
+def extract_table_from_image(img_pil):
+    config = '--psm 6'
+    text = pytesseract.image_to_string(img_pil, config=config)
 
-        horizontal = cv2.erode(horizontal, horizontalStructure)
-        horizontal = cv2.dilate(horizontal, horizontalStructure)
-        vertical = cv2.erode(vertical, verticalStructure)
-        vertical = cv2.dilate(vertical, verticalStructure)
+    rows = [line.strip() for line in text.split('\n') if line.strip()]
+    data = []
 
-        mask = cv2.add(horizontal, vertical)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes = [(x, y, x + w, y + h) for cnt in contours if (w := cv2.boundingRect(cnt)[2]) > 40 and (h := cv2.boundingRect(cnt)[3]) > 20]
-        return sorted(boxes, key=lambda b: (b[1], b[0]))
-    except Exception as e:
-        print(f"Error in table detection: {e}")
-        return []
-
-# OCR-based table extraction
-def extract_table_from_crop(crop_img):
-    try:
-        if not TESSERACT_AVAILABLE:
-            print("❌ Tesseract not available.")
-            return pd.DataFrame()
-
-        ocr_text = pytesseract.image_to_string(crop_img, config='--psm 6', lang='eng')
-        rows = [line for line in ocr_text.split('\n') if line.strip()]
-        if not rows:
-            return pd.DataFrame()
-
-        data = []
-        for row in rows:
-            if '\t' in row:
-                columns = row.split('\t')
-            elif '  ' in row:
-                columns = re.split(r' {2,}', row)
-            else:
-                columns = re.split(r'[|,;]', row)
-            columns = [col.strip() for col in columns if col.strip()]
-            if columns:
-                data.append(columns)
-
-        if len(data) > 1:
-            if len(data[0]) > 1:
-                df = pd.DataFrame(data[1:], columns=data[0])
-            else:
-                max_cols = max(len(row) for row in data)
-                df = pd.DataFrame(data, columns=[f'Column_{i+1}' for i in range(max_cols)])
-        elif len(data) == 1:
-            df = pd.DataFrame([data[0]], columns=[f'Column_{i+1}' for i in range(len(data[0]))])
+    for row in rows:
+        if '\t' in row:
+            cols = row.split('\t')
+        elif '  ' in row:
+            cols = re.split(r'\s{2,}', row)
         else:
-            df = pd.DataFrame()
+            cols = re.split(r'[|,;]', row)
+        cols = [c.strip() for c in cols if c.strip()]
+        if cols:
+            data.append(cols)
 
-        return df
-    except Exception as e:
-        print(f"Error in table extraction: {e}")
+    if not data:
         return pd.DataFrame()
 
-# Camelot Extraction
-def extract_tables_with_camelot(pdf_bytes):
-    tables = []
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as tmp:
-        tmp.write(pdf_bytes)
-        tmp.flush()
-        print("🔍 [Camelot] Extracting tables...")
-        try:
-            tables_lattice = camelot.read_pdf(tmp.name, pages='all', flavor='lattice')
-            tables_stream = camelot.read_pdf(tmp.name, pages='all', flavor='stream')
-            all_tables = tables_lattice + tables_stream
-            print(f"✅ [Camelot] Found {len(all_tables)} tables")
-            for t in all_tables:
-                if not t.df.empty:
-                    tables.append(t.df)
-            return tables
-        except Exception as e:
-            print(f"❌ [Camelot] Failed: {e}")
-            return []
+    max_cols = max(len(r) for r in data)
+    columns = [f'Column_{i+1}' for i in range(max_cols)]
+    df = pd.DataFrame(data, columns=columns)
+    return df
 
-# Main Function
-def deep_table_extract(pdf_bytes):
-    if isinstance(pdf_bytes, str):
-        raise ValueError("❌ Expected bytes input, not string.")
+# PDF to Table Extraction (Full Pipeline)
+def extract_tables_from_pdf(pdf_bytes):
+    images = convert_from_bytes(pdf_bytes, dpi=300)
+    all_tables = []
 
-    if CAMELOT_AVAILABLE:
-        tables = extract_tables_with_camelot(pdf_bytes)
-        if tables:
-            return tables
+    for page_num, img_pil in enumerate(images, 1):
+        print(f"📄 Processing page {page_num}")
+        processed_img = preprocess_for_ocr(img_pil)
+        df = extract_table_from_image(processed_img)
+        if not df.empty:
+            print(f"✅ Table found on page {page_num}, rows: {len(df)}")
+            all_tables.append({
+                'table': len(all_tables)+1,
+                'page': page_num,
+                'columns': df.columns.tolist(),
+                'rows': df.to_dict(orient='records')
+            })
         else:
-            print("⚠️ No tables found with Camelot. Falling back to OCR...")
+            print(f"⚠️ No table found on page {page_num}")
 
-    if not TESSERACT_AVAILABLE:
-        raise Exception("Tesseract OCR is required for image-based PDF processing.")
-
-    try:
-        print("🔄 Converting PDF to images...")
-        images = convert_from_bytes(pdf_bytes)
-        print(f"📄 Converted {len(images)} pages")
-
-        all_tables = []
-
-        for page_num, img_pil in enumerate(images, 1):
-            print(f"\n📃 Page {page_num}")
-            img = preprocess_image(img_pil)
-            boxes = detect_tables_opencv(img)
-
-            if not boxes:
-                boxes = [(0, 0, img.shape[1], img.shape[0])]
-                print("📋 No tables detected. Using full page.")
-
-            for idx, (x1, y1, x2, y2) in enumerate(boxes, 1):
-                crop = img[y1:y2, x1:x2]
-                if isinstance(crop, bytes):
-                    raise ValueError("Expected image array, got bytes.")
-                crop_pil = Image.fromarray(crop)
-                df = extract_table_from_crop(crop_pil)
-                if not df.empty:
-                    all_tables.append(df)
-                    print(f"✅ Table {idx} extracted with {len(df)} rows")
-                else:
-                    print(f"⚠️ Table {idx} is empty")
-
-        print(f"\n🎉 OCR Extraction complete. {len(all_tables)} tables found.")
-        return all_tables
-
-    except Exception as e:
-        print(f"❌ OCR extraction failed: {e}")
-        print(traceback.format_exc())
-        return []
-
-# Optional: test entry
-if __name__ == "__main__":
-    print("🚀 Ready to extract tables. Use deep_table_extract(pdf_bytes)")
+    return all_tables
