@@ -11,13 +11,15 @@ import pdfplumber
 import pandas as pd
 import io
 import re
-import camelot
-import logging
 from pdf2image import convert_from_bytes
+from paddleocr import PaddleOCR, PPStructure
+import pytesseract
 from PIL import Image
 import numpy as np
+import cv2
 from transformers import pipeline
 import json
+import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -30,9 +32,9 @@ if not os.path.exists(TEMP_DIR):
 
 # FastAPI app setup
 app = FastAPI(
-    title="Production PDF Table Extractor API with Camelot",
-    description="Upload PDF, get unique download links for HTML, Excel, CSV, JSON, TallyXML. Supports text-based and image-based PDFs with table detection. Files auto-delete after 10 min.",
-    version="2.1.0-prod"
+    title="Production PDF Table Extractor API with OCR",
+    description="Upload PDF, get unique download links for HTML, Excel, CSV, JSON, TallyXML. Supports text-based and image-based PDFs with enhanced OCR for low-quality images. Files auto-delete after 10 min.",
+    version="2.2.0-prod"
 )
 
 # Allowed frontend domains
@@ -66,17 +68,63 @@ def cleanup_temp_files():
             if now - mtime > FILE_LIFETIME:
                 try:
                     shutil.rmtree(folder_path)
-                except Exception:
-                    pass
+                    logger.info(f"Cleaned up expired folder: {folder_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up {folder_path}: {str(e)}")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(cleanup_temp_files, 'interval', seconds=CLEANUP_INTERVAL)
 scheduler.start()
 
+# Initialize PaddleOCR and PPStructure
+try:
+    ocr = PaddleOCR(use_angle_cls=True, lang='en')
+    logger.info("PaddleOCR initialized successfully.")
+except Exception as e:
+    logger.error(f"PaddleOCR initialization failed: {str(e)}")
+    ocr = None
+
+try:
+    table_engine = PPStructure(table=True, ocr=True, show_log=False)
+    TABLE_ENGINE_AVAILABLE = True
+    logger.info("PPStructure initialized successfully.")
+except Exception as e:
+    logger.warning(f"PPStructure initialization failed: {str(e)}. Falling back to basic OCR.")
+    table_engine = None
+    TABLE_ENGINE_AVAILABLE = False
+
 # Supported formats
 SUPPORTED_FORMATS = ["html", "excel", "csv", "json", "tallyxml"]
 
 # Helper functions
+def preprocess_image(img_np):
+    """Preprocess image for low-quality PDFs using OpenCV."""
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        # Apply noise reduction
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        # Apply contrast enhancement (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        # Apply sharpening
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        sharp = cv2.filter2D(gray, -1, kernel)
+        # Apply morphological dilation to enhance text
+        kernel = np.ones((2, 2), np.uint8)
+        dilate = cv2.dilate(sharp, kernel, iterations=1)
+        # Apply adaptive thresholding
+        thresh = cv2.adaptiveThreshold(
+            dilate, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        # Convert back to RGB for compatibility
+        img_np = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
+        logger.info("Image preprocessing completed successfully.")
+        return img_np
+    except Exception as e:
+        logger.warning(f"Image preprocessing failed: {str(e)}. Using original image.")
+        return img_np
+
 def normalize_date(date_str):
     """Normalize various date formats to YYYY-MM-DD."""
     if not date_str or pd.isna(date_str):
@@ -223,6 +271,7 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
         pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
         for page_num, page in enumerate(pdf.pages, 1):
             if page is None:
+                logger.warning(f"Page {page_num} is None in pdfplumber.")
                 continue
             found_table = False
             for table in page.find_tables():
@@ -248,70 +297,114 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
                     found_table = True
             if found_table:
                 non_blank_pages.add(page_num)
+                logger.info(f"Found tables on page {page_num} with pdfplumber.")
         pdf.close()
     except Exception as e:
         if "password" in str(e).lower() or "encrypted" in str(e).lower():
             raise Exception("PDF is password protected" if not password else "Incorrect PDF password")
-        logger.info("No tables found with pdfplumber, proceeding to Camelot.")
+        logger.info(f"No tables found with pdfplumber: {str(e)}. Proceeding to OCR.")
 
-    # Step 2: Table extraction for image-based PDFs with Camelot
+    # Step 2: OCR for image-based PDFs
     if not tables:
         try:
-            # Save PDF bytes to a temporary file for Camelot
-            temp_pdf_path = os.path.join(out_dir, "temp.pdf")
-            with open(temp_pdf_path, "wb") as f:
-                f.write(pdf_bytes)
-            
-            # Try lattice mode first (for tables with borders)
-            camelot_tables = camelot.read_pdf(
-                temp_pdf_path,
-                flavor='lattice',
-                pages='all',
-                backend='poppler',
-                suppress_stdout=True
-            )
-            
-            if not camelot_tables or camelot_tables.n == 0:
-                # Fallback to stream mode for low-quality or borderless tables
-                camelot_tables = camelot.read_pdf(
-                    temp_pdf_path,
-                    flavor='stream',
-                    pages='all',
-                    backend='poppler',
-                    suppress_stdout=True
-                )
-            
-            for table in camelot_tables:
-                df = table.df
-                # Normalize data
-                for col in df.columns:
-                    if 'date' in str(col).lower():
-                        df[col] = df[col].apply(normalize_date)
-                    elif any(k in str(col).lower() for k in ['amount', 'debit', 'credit', 'balance']):
-                        df[col] = df[col].apply(normalize_amount)
-                # Optional categorization
-                if categorize and classifier:
-                    desc_col = next((col for col in df.columns if 'desc' in str(col).lower() or 'particular' in str(col).lower()), None)
-                    if desc_col:
-                        df['Category'] = df[desc_col].apply(lambda x: categorize_transaction(x, classifier))
-                page_num = table.page
-                tables.append({"page": page_num, "data": df})
-                headers_key = tuple(df.columns)
-                if headers_key not in unique_tables:
-                    unique_tables[headers_key] = []
-                unique_tables[headers_key].append(df)
-                non_blank_pages.add(page_num)
-            
-            # Clean up temporary PDF
-            if os.path.exists(temp_pdf_path):
-                os.remove(temp_pdf_path)
-                
+            images = convert_from_bytes(pdf_bytes, dpi=300)  # Use dpi=300 for balance; increase to 400 if needed
+            if not images:
+                logger.error("pdf2image returned no images.")
+                return 0, 0, None, None, {}
+            logger.info(f"Converted PDF to {len(images)} images for OCR.")
+            for page_num, img in enumerate(images, 1):
+                img_np = np.array(img)
+                # Preprocess image for low-quality PDFs
+                img_np = preprocess_image(img_np)
+                if TABLE_ENGINE_AVAILABLE and table_engine:
+                    try:
+                        result = table_engine(img_np)
+                        found_table = False
+                        for res in result:
+                            if res['type'] == 'table':
+                                # Extract table HTML and convert to DataFrame
+                                html_table = res['res']['html']
+                                dfs = pd.read_html(html_table)
+                                if dfs:
+                                    df = dfs[0]
+                                    # Normalize data
+                                    for col in df.columns:
+                                        if 'date' in str(col).lower():
+                                            df[col] = df[col].apply(normalize_date)
+                                        elif any(k in str(col).lower() for k in ['amount', 'debit', 'credit', 'balance']):
+                                            df[col] = df[col].apply(normalize_amount)
+                                    # Optional categorization
+                                    if categorize and classifier:
+                                        desc_col = next((col for col in df.columns if 'desc' in str(col).lower() or 'particular' in str(col).lower()), None)
+                                        if desc_col:
+                                            df['Category'] = df[desc_col].apply(lambda x: categorize_transaction(x, classifier))
+                                    tables.append({"page": page_num, "data": df})
+                                    headers_key = tuple(df.columns)
+                                    if headers_key not in unique_tables:
+                                        unique_tables[headers_key] = []
+                                    unique_tables[headers_key].append(df)
+                                    non_blank_pages.add(page_num)
+                                    found_table = True
+                        if found_table:
+                            logger.info(f"Found tables on page {page_num} with PPStructure.")
+                    except Exception as e:
+                        logger.warning(f"PPStructure failed for page {page_num}: {str(e)}. Falling back to basic OCR.")
+                # Fallback to basic PaddleOCR
+                if ocr:
+                    try:
+                        result = ocr.ocr(img_np, cls=True)
+                        lines = []
+                        for line in result[0]:
+                            text = line[1][0]
+                            if text.strip():
+                                lines.append([text])
+                        if lines:
+                            df = pd.DataFrame(lines, columns=["Text"])
+                            # Normalize data
+                            for col in df.columns:
+                                df[col] = df[col].apply(normalize_date) if 'date' in col.lower() else df[col]
+                                df[col] = df[col].apply(normalize_amount) if any(k in col.lower() for k in ['amount', 'debit', 'credit', 'balance']) else df[col]
+                            # Optional categorization
+                            if categorize and classifier:
+                                df['Category'] = df['Text'].apply(lambda x: categorize_transaction(x, classifier))
+                            tables.append({"page": page_num, "data": df})
+                            headers_key = tuple(df.columns)
+                            if headers_key not in unique_tables:
+                                unique_tables[headers_key] = []
+                            unique_tables[headers_key].append(df)
+                            non_blank_pages.add(page_num)
+                            logger.info(f"Extracted text on page {page_num} with PaddleOCR.")
+                    except Exception as e:
+                        logger.warning(f"PaddleOCR failed for page {page_num}: {str(e)}. Falling back to Tesseract.")
+                # Fallback to Tesseract
+                try:
+                    text = pytesseract.image_to_string(Image.fromarray(img_np), lang='eng')
+                    lines = [line.strip() for line in text.split('\n') if line.strip()]
+                    if lines:
+                        df = pd.DataFrame(lines, columns=["Text"])
+                        # Normalize data
+                        for col in df.columns:
+                            df[col] = df[col].apply(normalize_date) if 'date' in col.lower() else df[col]
+                            df[col] = df[col].apply(normalize_amount) if any(k in col.lower() for k in ['amount', 'debit', 'credit', 'balance']) else df[col]
+                        # Optional categorization
+                        if categorize and classifier:
+                            df['Category'] = df['Text'].apply(lambda x: categorize_transaction(x, classifier))
+                        tables.append({"page": page_num, "data": df})
+                        headers_key = tuple(df.columns)
+                        if headers_key not in unique_tables:
+                            unique_tables[headers_key] = []
+                        unique_tables[headers_key].append(df)
+                        non_blank_pages.add(page_num)
+                        logger.info(f"Extracted text on page {page_num} with Tesseract.")
+                except Exception as e:
+                    logger.error(f"Tesseract OCR failed for page {page_num}: {str(e)}")
         except Exception as e:
-            logger.error(f"Camelot processing error: {str(e)}")
-            raise Exception(f"Table extraction error: {str(e)}")
+            logger.error(f"Image conversion or OCR processing error: {str(e)}")
+            return 0, len(non_blank_pages), None, None, {}
 
     if not tables:
-        return 0, 0, None, None, {}
+        logger.error("No tables detected after all extraction attempts.")
+        return 0, len(non_blank_pages), None, None, {}
 
     # Step 3: Save outputs
     if file_map is None:
@@ -329,11 +422,13 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
         html += t['data'].to_html(index=False, border=1)
     with open(os.path.join(out_dir, file_map["html"]), "w", encoding="utf-8") as f:
         f.write(html)
+        logger.info(f"Saved HTML output to {file_map['html']}")
 
     # Save Excel
     with pd.ExcelWriter(os.path.join(out_dir, file_map["excel"]), engine='xlsxwriter') as writer:
         for i, t in enumerate(tables):
             t['data'].to_excel(writer, sheet_name=f"Table_{i+1}_Page_{t['page']}", index=False)
+        logger.info(f"Saved Excel output to {file_map['excel']}")
 
     # Save CSV
     with open(os.path.join(out_dir, file_map["csv"]), "w", encoding="utf-8") as f:
@@ -341,6 +436,7 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
             merged_df = pd.concat(dfs, ignore_index=True)
             merged_df.to_csv(f, index=False)
             f.write("\n\n")
+        logger.info(f"Saved CSV output to {file_map['csv']}")
 
     # Save JSON
     json_data = []
@@ -353,14 +449,17 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
         })
     with open(os.path.join(out_dir, file_map["json"]), "w", encoding="utf-8") as f:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"Saved JSON output to {file_map['json']}")
 
     # Save Tally XML
     tally_xml = to_tally_xml(tables)
     with open(os.path.join(out_dir, file_map["tallyxml"]), "w", encoding="utf-8") as f:
         f.write(tally_xml)
+        logger.info(f"Saved Tally XML output to {file_map['tallyxml']}")
 
     # Extract balances
     opening, closing = extract_balances(tables, unique_tables)
+    logger.info(f"Extracted {len(tables)} tables across {len(non_blank_pages)} pages.")
     return len(tables), len(non_blank_pages), opening, closing, unique_tables
 
 @app.post("/upload")
@@ -383,6 +482,7 @@ async def upload_pdf(
     file_id = str(uuid.uuid4())
     out_dir = os.path.join(TEMP_DIR, file_id)
     os.makedirs(out_dir, exist_ok=True)
+    logger.info(f"Processing PDF with file_id: {file_id}")
 
     base_name = os.path.splitext(file.filename)[0]
     file_map = {
@@ -395,6 +495,7 @@ async def upload_pdf(
 
     with open(os.path.join(out_dir, "original.pdf"), "wb") as f:
         f.write(pdf_bytes)
+        logger.info(f"Saved original PDF to {out_dir}/original.pdf")
 
     try:
         tables_found, pages_count, opening_balance, closing_balance, unique_tables = extract_and_save(
@@ -411,6 +512,7 @@ async def upload_pdf(
     except Exception as e:
         err_msg = str(e).lower()
         shutil.rmtree(out_dir)
+        logger.error(f"Processing failed: {str(e)}")
         if any(keyword in err_msg for keyword in ["password", "encrypted", "incorrect password", "protected"]):
             return {
                 "success": False,
@@ -435,6 +537,7 @@ async def upload_pdf(
 
     if tables_found == 0:
         shutil.rmtree(out_dir)
+        logger.warning(f"No tables found. Processed {pages_count} pages.")
         return {
             "success": False,
             "error_code": "NO_TABLES_FOUND",
@@ -444,6 +547,7 @@ async def upload_pdf(
         }
 
     links = {fmt: f"/download/{file_id}/{fmt}" for fmt in SUPPORTED_FORMATS}
+    logger.info(f"Successfully processed PDF. Tables found: {tables_found}, Pages: {pages_count}")
     return {
         "success": True,
         "tables_found": tables_found,
@@ -465,6 +569,7 @@ def download_file(file_id: str, fmt: str):
     out_dir = os.path.join(TEMP_DIR, safe_id)
 
     if not os.path.exists(out_dir):
+        logger.error(f"Download failed: Directory {out_dir} not found or expired.")
         raise HTTPException(status_code=404, detail="File not found or expired.")
 
     files = os.listdir(out_dir)
@@ -486,10 +591,12 @@ def download_file(file_id: str, fmt: str):
             break
 
     if not file_name:
+        logger.error(f"Download failed: No file found for format {fmt} in {out_dir}.")
         raise HTTPException(status_code=404, detail="Requested format not found.")
 
     file_path = os.path.join(out_dir, file_name)
     if not os.path.exists(file_path):
+        logger.error(f"Download failed: File {file_path} not found or expired.")
         raise HTTPException(status_code=404, detail="File not found or expired.")
 
     media_types = {
@@ -500,8 +607,9 @@ def download_file(file_id: str, fmt: str):
         "tallyxml": "application/xml"
     }
 
+    logger.info(f"Downloading file: {file_path}")
     return FileResponse(file_path, media_type=media_types[fmt], filename=file_name)
 
 @app.get("/")
 def root():
-    return {"message": "Production PDF Table Extractor API with Camelot. POST /upload with PDF, get download links."}
+    return {"message": "Production PDF Table Extractor API with OCR. POST /upload with PDF, get download links."}
