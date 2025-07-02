@@ -11,26 +11,17 @@ import pdfplumber
 import pandas as pd
 import io
 import re
+import camelot
+import logging
 from pdf2image import convert_from_bytes
-from paddleocr import PaddleOCR
 from PIL import Image
 import numpy as np
 from transformers import pipeline
 import json
-import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Try importing PPStructure, with fallback
-try:
-    from paddleocr import PPStructure
-    TABLE_ENGINE_AVAILABLE = True
-except ImportError:
-    logger.warning("PPStructure not available. Falling back to basic OCR.")
-    PPStructure = None
-    TABLE_ENGINE_AVAILABLE = False
 
 # Directory to store temp files
 TEMP_DIR = "temp_files"
@@ -39,8 +30,8 @@ if not os.path.exists(TEMP_DIR):
 
 # FastAPI app setup
 app = FastAPI(
-    title="Production PDF Table Extractor API with OCR",
-    description="Upload PDF, get unique download links for HTML, Excel, CSV, JSON, TallyXML. Supports text-based and image-based PDFs with OCR and table detection. Files auto-delete after 10 min.",
+    title="Production PDF Table Extractor API with Camelot",
+    description="Upload PDF, get unique download links for HTML, Excel, CSV, JSON, TallyXML. Supports text-based and image-based PDFs with table detection. Files auto-delete after 10 min.",
     version="2.1.0-prod"
 )
 
@@ -81,11 +72,6 @@ def cleanup_temp_files():
 scheduler = BackgroundScheduler()
 scheduler.add_job(cleanup_temp_files, 'interval', seconds=CLEANUP_INTERVAL)
 scheduler.start()
-
-# Initialize PaddleOCR
-ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
-# Initialize PPStructure if available
-table_engine = PPStructure(table=True, ocr=True, show_log=False) if TABLE_ENGINE_AVAILABLE else None
 
 # Supported formats
 SUPPORTED_FORMATS = ["html", "excel", "csv", "json", "tallyxml"]
@@ -266,60 +252,63 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
     except Exception as e:
         if "password" in str(e).lower() or "encrypted" in str(e).lower():
             raise Exception("PDF is password protected" if not password else "Incorrect PDF password")
-        logger.info("No tables found with pdfplumber, proceeding to OCR.")
+        logger.info("No tables found with pdfplumber, proceeding to Camelot.")
 
-    # Step 2: OCR for image-based PDFs
+    # Step 2: Table extraction for image-based PDFs with Camelot
     if not tables:
         try:
-            images = convert_from_bytes(pdf_bytes, dpi=300)
-            for page_num, img in enumerate(images, 1):
-                img_np = np.array(img)
-                if TABLE_ENGINE_AVAILABLE and table_engine:
-                    result = table_engine(img_np)
-                    for res in result:
-                        if res['type'] == 'table':
-                            # Extract table HTML and convert to DataFrame
-                            html_table = res['res']['html']
-                            dfs = pd.read_html(html_table)
-                            if dfs:
-                                df = dfs[0]
-                                # Normalize data
-                                for col in df.columns:
-                                    if 'date' in str(col).lower():
-                                        df[col] = df[col].apply(normalize_date)
-                                    elif any(k in str(col).lower() for k in ['amount', 'debit', 'credit', 'balance']):
-                                        df[col] = df[col].apply(normalize_amount)
-                                # Optional categorization
-                                if categorize and classifier:
-                                    desc_col = next((col for col in df.columns if 'desc' in str(col).lower() or 'particular' in str(col).lower()), None)
-                                    if desc_col:
-                                        df['Category'] = df[desc_col].apply(lambda x: categorize_transaction(x, classifier))
-                                tables.append({"page": page_num, "data": df})
-                                headers_key = tuple(df.columns)
-                                if headers_key not in unique_tables:
-                                    unique_tables[headers_key] = []
-                                unique_tables[headers_key].append(df)
-                                non_blank_pages.add(page_num)
-                else:
-                    # Fallback to basic OCR
-                    result = ocr.ocr(img_np, cls=True)
-                    # Simple parsing of OCR results into a table-like structure
-                    lines = []
-                    for line in result[0]:
-                        text = line[1][0]
-                        if text.strip():
-                            lines.append([text])
-                    if lines:
-                        df = pd.DataFrame(lines, columns=["Text"])
-                        tables.append({"page": page_num, "data": df})
-                        headers_key = tuple(df.columns)
-                        if headers_key not in unique_tables:
-                            unique_tables[headers_key] = []
-                        unique_tables[headers_key].append(df)
-                        non_blank_pages.add(page_num)
+            # Save PDF bytes to a temporary file for Camelot
+            temp_pdf_path = os.path.join(out_dir, "temp.pdf")
+            with open(temp_pdf_path, "wb") as f:
+                f.write(pdf_bytes)
+            
+            # Try lattice mode first (for tables with borders)
+            camelot_tables = camelot.read_pdf(
+                temp_pdf_path,
+                flavor='lattice',
+                pages='all',
+                backend='poppler',
+                suppress_stdout=True
+            )
+            
+            if not camelot_tables or camelot_tables.n == 0:
+                # Fallback to stream mode for low-quality or borderless tables
+                camelot_tables = camelot.read_pdf(
+                    temp_pdf_path,
+                    flavor='stream',
+                    pages='all',
+                    backend='poppler',
+                    suppress_stdout=True
+                )
+            
+            for table in camelot_tables:
+                df = table.df
+                # Normalize data
+                for col in df.columns:
+                    if 'date' in str(col).lower():
+                        df[col] = df[col].apply(normalize_date)
+                    elif any(k in str(col).lower() for k in ['amount', 'debit', 'credit', 'balance']):
+                        df[col] = df[col].apply(normalize_amount)
+                # Optional categorization
+                if categorize and classifier:
+                    desc_col = next((col for col in df.columns if 'desc' in str(col).lower() or 'particular' in str(col).lower()), None)
+                    if desc_col:
+                        df['Category'] = df[desc_col].apply(lambda x: categorize_transaction(x, classifier))
+                page_num = table.page
+                tables.append({"page": page_num, "data": df})
+                headers_key = tuple(df.columns)
+                if headers_key not in unique_tables:
+                    unique_tables[headers_key] = []
+                unique_tables[headers_key].append(df)
+                non_blank_pages.add(page_num)
+            
+            # Clean up temporary PDF
+            if os.path.exists(temp_pdf_path):
+                os.remove(temp_pdf_path)
+                
         except Exception as e:
-            logger.error(f"OCR processing error: {str(e)}")
-            raise Exception(f"OCR processing error: {str(e)}")
+            logger.error(f"Camelot processing error: {str(e)}")
+            raise Exception(f"Table extraction error: {str(e)}")
 
     if not tables:
         return 0, 0, None, None, {}
@@ -515,4 +504,4 @@ def download_file(file_id: str, fmt: str):
 
 @app.get("/")
 def root():
-    return {"message": "Production PDF Table Extractor API with OCR. POST /upload with PDF, get download links."}
+    return {"message": "Production PDF Table Extractor API with Camelot. POST /upload with PDF, get download links."}
