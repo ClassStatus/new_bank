@@ -15,7 +15,7 @@ from pdf2image import convert_from_bytes
 from paddleocr import PaddleOCR, PPStructure
 from PIL import Image
 import numpy as np
-from transformers import pipeline  # For optional NLP categorization
+from transformers import pipeline
 import json
 
 # Directory to store temp files
@@ -69,8 +69,11 @@ scheduler.add_job(cleanup_temp_files, 'interval', seconds=CLEANUP_INTERVAL)
 scheduler.start()
 
 # Initialize PaddleOCR and PPStructure
-ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)  # Set use_gpu=True if GPU is available
+ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
 table_engine = PPStructure(table=True, ocr=True, show_log=False)
+
+# Supported formats
+SUPPORTED_FORMATS = ["html", "excel", "csv", "json", "tallyxml"]
 
 # Helper functions
 def normalize_date(date_str):
@@ -87,7 +90,7 @@ def normalize_date(date_str):
                 return datetime.strptime(date_str, fmt).strftime('%Y-%m-%d')
             except ValueError:
                 continue
-        return date_str  # Return as is if no format matches
+        return date_str
     except:
         return date_str
 
@@ -122,6 +125,7 @@ def extract_balances(tables, unique_tables=None):
             balance_col = None
             for col in merged.columns:
                 if col is not None and 'balance' in str(col).lower():
+                    balance老
                     balance_col = col
                     break
             if balance_col:
@@ -243,7 +247,7 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
                     unique_tables[headers_key].append(df)
                     found_table = True
             if found_table:
-                non_blankinel pages.add(page_num)
+                non_blank_pages.add(page_num)  # Corrected line
         pdf.close()
     except Exception as e:
         if "password" in str(e).lower() or "encrypted" in str(e).lower():
@@ -286,7 +290,7 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
             raise Exception(f"OCR processing error: {str(e)}")
 
     if not tables:
-        return 0, 0, None, None
+        return 0, 0, None, None, {}
 
     # Step 3: Save outputs
     if file_map is None:
