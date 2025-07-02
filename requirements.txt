@@ -6,10 +6,11 @@ xlsxwriter
 python-multipart
 apscheduler
 pdf2image
-camelot-py>=0.10.1
+paddlepaddle>=2.6.0
+paddleocr>=2.7.0
 transformers
 torch
 numpy
 Pillow
 opencv-python-headless
-ghostscript
+pytesseract
