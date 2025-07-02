@@ -12,11 +12,25 @@ import pandas as pd
 import io
 import re
 from pdf2image import convert_from_bytes
-from paddleocr import PaddleOCR, PPStructure
+from paddleocr import PaddleOCR
 from PIL import Image
 import numpy as np
 from transformers import pipeline
 import json
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Try importing PPStructure, with fallback
+try:
+    from paddleocr import PPStructure
+    TABLE_ENGINE_AVAILABLE = True
+except ImportError:
+    logger.warning("PPStructure not available. Falling back to basic OCR.")
+    PPStructure = None
+    TABLE_ENGINE_AVAILABLE = False
 
 # Directory to store temp files
 TEMP_DIR = "temp_files"
@@ -68,9 +82,10 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(cleanup_temp_files, 'interval', seconds=CLEANUP_INTERVAL)
 scheduler.start()
 
-# Initialize PaddleOCR and PPStructure
+# Initialize PaddleOCR
 ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
-table_engine = PPStructure(table=True, ocr=True, show_log=False)
+# Initialize PPStructure if available
+table_engine = PPStructure(table=True, ocr=True, show_log=False) if TABLE_ENGINE_AVAILABLE else None
 
 # Supported formats
 SUPPORTED_FORMATS = ["html", "excel", "csv", "json", "tallyxml"]
@@ -125,7 +140,6 @@ def extract_balances(tables, unique_tables=None):
             balance_col = None
             for col in merged.columns:
                 if col is not None and 'balance' in str(col).lower():
-                    balance老
                     balance_col = col
                     break
             if balance_col:
@@ -247,12 +261,12 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
                     unique_tables[headers_key].append(df)
                     found_table = True
             if found_table:
-                non_blank_pages.add(page_num)  # Corrected line
+                non_blank_pages.add(page_num)
         pdf.close()
     except Exception as e:
         if "password" in str(e).lower() or "encrypted" in str(e).lower():
             raise Exception("PDF is password protected" if not password else "Incorrect PDF password")
-        # If no text/tables found, proceed to OCR
+        logger.info("No tables found with pdfplumber, proceeding to OCR.")
 
     # Step 2: OCR for image-based PDFs
     if not tables:
@@ -260,33 +274,51 @@ def extract_and_save(pdf_bytes, out_dir, password=None, file_map=None, categoriz
             images = convert_from_bytes(pdf_bytes, dpi=300)
             for page_num, img in enumerate(images, 1):
                 img_np = np.array(img)
-                result = table_engine(img_np)
-                table_data = []
-                for res in result:
-                    if res['type'] == 'table':
-                        # Extract table HTML and convert to DataFrame
-                        html_table = res['res']['html']
-                        dfs = pd.read_html(html_table)
-                        if dfs:
-                            df = dfs[0]
-                            # Normalize data
-                            for col in df.columns:
-                                if 'date' in str(col).lower():
-                                    df[col] = df[col].apply(normalize_date)
-                                elif any(k in str(col).lower() for k in ['amount', 'debit', 'credit', 'balance']):
-                                    df[col] = df[col].apply(normalize_amount)
-                            # Optional categorization
-                            if categorize and classifier:
-                                desc_col = next((col for col in df.columns if 'desc' in str(col).lower() or 'particular' in str(col).lower()), None)
-                                if desc_col:
-                                    df['Category'] = df[desc_col].apply(lambda x: categorize_transaction(x, classifier))
-                            tables.append({"page": page_num, "data": df})
-                            headers_key = tuple(df.columns)
-                            if headers_key not in unique_tables:
-                                unique_tables[headers_key] = []
-                            unique_tables[headers_key].append(df)
-                            non_blank_pages.add(page_num)
+                if TABLE_ENGINE_AVAILABLE and table_engine:
+                    result = table_engine(img_np)
+                    for res in result:
+                        if res['type'] == 'table':
+                            # Extract table HTML and convert to DataFrame
+                            html_table = res['res']['html']
+                            dfs = pd.read_html(html_table)
+                            if dfs:
+                                df = dfs[0]
+                                # Normalize data
+                                for col in df.columns:
+                                    if 'date' in str(col).lower():
+                                        df[col] = df[col].apply(normalize_date)
+                                    elif any(k in str(col).lower() for k in ['amount', 'debit', 'credit', 'balance']):
+                                        df[col] = df[col].apply(normalize_amount)
+                                # Optional categorization
+                                if categorize and classifier:
+                                    desc_col = next((col for col in df.columns if 'desc' in str(col).lower() or 'particular' in str(col).lower()), None)
+                                    if desc_col:
+                                        df['Category'] = df[desc_col].apply(lambda x: categorize_transaction(x, classifier))
+                                tables.append({"page": page_num, "data": df})
+                                headers_key = tuple(df.columns)
+                                if headers_key not in unique_tables:
+                                    unique_tables[headers_key] = []
+                                unique_tables[headers_key].append(df)
+                                non_blank_pages.add(page_num)
+                else:
+                    # Fallback to basic OCR
+                    result = ocr.ocr(img_np, cls=True)
+                    # Simple parsing of OCR results into a table-like structure
+                    lines = []
+                    for line in result[0]:
+                        text = line[1][0]
+                        if text.strip():
+                            lines.append([text])
+                    if lines:
+                        df = pd.DataFrame(lines, columns=["Text"])
+                        tables.append({"page": page_num, "data": df})
+                        headers_key = tuple(df.columns)
+                        if headers_key not in unique_tables:
+                            unique_tables[headers_key] = []
+                        unique_tables[headers_key].append(df)
+                        non_blank_pages.add(page_num)
         except Exception as e:
+            logger.error(f"OCR processing error: {str(e)}")
             raise Exception(f"OCR processing error: {str(e)}")
 
     if not tables:
