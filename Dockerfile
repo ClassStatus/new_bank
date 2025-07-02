@@ -4,17 +4,17 @@ FROM python:3.9-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies required for pdf2image, PaddleOCR, and PPStructure
+# Install system dependencies required for pdf2image, camelot-py, and Ghostscript
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
     poppler-utils \
-    tesseract-ocr \
-    libtesseract-dev \
-    gcc \
-    g++ \
+    ghostscript \
+    python3-opencv \
     libjpeg-dev \
     zlib1g-dev \
+    gcc \
+    g++ \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,4 +31,4 @@ COPY simple_pdf_api.py .
 EXPOSE 8000
 
 # Command to run the FastAPI application with Uvicorn
-CMD ["uvicorn", "simple_pdf_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "simple_pdf_api:app", "--host", "0.0.0.0", "--port", "1000"]
